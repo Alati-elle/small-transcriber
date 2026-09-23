@@ -41,6 +41,23 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, **kwargs)
 
 
+def run_gemini_curl(command, key, payload, **kwargs):
+    if "\n" in key or "\r" in key:
+        raise ValueError("Недопустимый API key")
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(write_fd, "wb") as header:
+            header.write(f"x-goog-api-key: {key}\n".encode("utf-8"))
+        return subprocess.run(
+            command + ["-H", f"@/dev/fd/{read_fd}", "--data-binary", "@-"],
+            input=payload,
+            pass_fds=(read_fd,),
+            **kwargs,
+        )
+    finally:
+        os.close(read_fd)
+
+
 def log(message=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if message:
@@ -160,7 +177,7 @@ def split_audio(source, outdir):
 def upload_audio(path, key):
     size = path.stat().st_size
 
-    headers = subprocess.run(
+    headers = run_gemini_curl(
         [
             "curl", "-4", "-sS",
             "--connect-timeout", str(CURL_CONNECT_TIMEOUT),
@@ -168,14 +185,14 @@ def upload_audio(path, key):
             "-D", "-",
             "-o", "/dev/null",
             UPLOAD_API,
-            "-H", f"x-goog-api-key: {key}",
             "-H", "X-Goog-Upload-Protocol: resumable",
             "-H", "X-Goog-Upload-Command: start",
             "-H", f"X-Goog-Upload-Header-Content-Length: {size}",
             "-H", "X-Goog-Upload-Header-Content-Type: audio/m4a",
             "-H", "Content-Type: application/json",
-            "-d", '{"file":{"display_name":"audio"}}',
         ],
+        key,
+        '{"file":{"display_name":"audio"}}',
         capture_output=True,
         text=True,
         check=True,
@@ -262,17 +279,17 @@ def transcribe(uri, key):
     while True:
         log(f"  Gemini: попытка {attempt}")
 
-        p = subprocess.run(
+        p = run_gemini_curl(
             [
                 "curl", "-4", "-sS",
             "--connect-timeout", str(CURL_CONNECT_TIMEOUT),
             "--max-time", str(CURL_MAX_TIME),
                 "-X", "POST",
                 API,
-                "-H", f"x-goog-api-key: {key}",
                 "-H", "Content-Type: application/json",
-                "-d", json.dumps(payload),
             ],
+            key,
+            json.dumps(payload),
             capture_output=True,
             text=True,
         )

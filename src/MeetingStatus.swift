@@ -389,9 +389,6 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusLabel.stringValue =
             "Подготавливаю расшифровку для Gemini…"
 
-        try? fm.removeItem(atPath: protocolJSON)
-        try? fm.removeItem(atPath: protocolHTML)
-
         runPython(
             script: protocolScript,
             arguments: [transcriptPath],
@@ -401,10 +398,16 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self = self else { return }
 
             if exitCode != 0 {
+                let previousProtocolExists =
+                    self.fileExistsAndNotEmpty(self.protocolJSON) &&
+                    self.fileExistsAndNotEmpty(self.protocolHTML)
                 self.finishError(
-                    "Протокол создать не удалось.",
+                    previousProtocolExists
+                        ? "Новый анализ не завершился. Предыдущий протокол сохранён."
+                        : "Протокол создать не удалось.",
                     logPath: self.protocolLog
                 )
+                self.openProtocolButton.isHidden = !previousProtocolExists
                 return
             }
 

@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -73,6 +74,23 @@ def get_key():
         )
 
     return p.stdout.strip()
+
+
+def run_gemini_curl(command, key, payload, **kwargs):
+    if "\n" in key or "\r" in key:
+        raise ValueError("Недопустимый API key")
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(write_fd, "wb") as header:
+            header.write(f"x-goog-api-key: {key}\n".encode("utf-8"))
+        return subprocess.run(
+            command + ["-H", f"@/dev/fd/{read_fd}", "--data-binary", "@-"],
+            input=payload,
+            pass_fds=(read_fd,),
+            **kwargs,
+        )
+    finally:
+        os.close(read_fd)
 
 
 def parse_transcript(path):
@@ -359,7 +377,7 @@ def call_gemini(batch, key, batch_number, total_batches):
                 f"модель {model}, запрос {request_number}"
             )
 
-            p = subprocess.run(
+            p = run_gemini_curl(
                 [
                     "curl",
                         "-4",
@@ -368,13 +386,10 @@ def call_gemini(batch, key, batch_number, total_batches):
                     "--max-time", "300",
                     "-X", "POST",
                     api,
-                    "-H", f"x-goog-api-key: {key}",
                     "-H", "Content-Type: application/json",
-                    "-d", json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                    ),
                 ],
+                key,
+                json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
             )
@@ -900,7 +915,7 @@ def consolidate_speakers(rows, key):
         max_503_attempts = 3
 
         while True:
-            p = subprocess.run(
+            p = run_gemini_curl(
                 [
                     "curl",
                         "-4",
@@ -909,13 +924,10 @@ def consolidate_speakers(rows, key):
                     "--max-time", "300",
                     "-X", "POST",
                     api,
-                    "-H", f"x-goog-api-key: {key}",
                     "-H", "Content-Type: application/json",
-                    "-d", json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                    ),
                 ],
+                key,
+                json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
             )
@@ -1197,7 +1209,7 @@ def detect_speakers(rows, key):
         max_503_attempts = 3
 
         while True:
-            p = subprocess.run(
+            p = run_gemini_curl(
                 [
                     "curl",
                         "-4",
@@ -1206,13 +1218,10 @@ def detect_speakers(rows, key):
                     "--max-time", "300",
                     "-X", "POST",
                     api,
-                    "-H", f"x-goog-api-key: {key}",
                     "-H", "Content-Type: application/json",
-                    "-d", json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                    ),
                 ],
+                key,
+                json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
             )
@@ -2222,6 +2231,43 @@ def output_paths(transcript_path):
     return json_path, html_path
 
 
+def publish_protocol(json_path, html_path, result, rendered):
+    with tempfile.TemporaryDirectory(
+        prefix=".protocol-", dir=json_path.parent
+    ) as staging_dir:
+        staging = Path(staging_dir)
+        staged_json = staging / json_path.name
+        staged_html = staging / html_path.name
+
+        with staged_json.open("w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        staged_html.write_text(rendered, encoding="utf-8")
+
+        if not staged_json.stat().st_size or not staged_html.stat().st_size:
+            raise RuntimeError("Новый протокол пуст; предыдущий сохранён")
+
+        targets = ((staged_json, json_path), (staged_html, html_path))
+        backups = {}
+        for _, target in targets:
+            if target.exists():
+                backup = staging / ("previous-" + target.name)
+                os.link(target, backup)
+                backups[target] = backup
+
+        published = []
+        try:
+            for staged, target in targets:
+                os.replace(staged, target)
+                published.append(target)
+        except OSError:
+            for target in reversed(published):
+                if target in backups:
+                    os.replace(backups[target], target)
+                else:
+                    target.unlink()
+            raise
+
+
 def main():
     if len(sys.argv) != 2:
         raise RuntimeError(
@@ -2489,17 +2535,6 @@ def main():
         "transcript": rows,
     }
 
-    with json_path.open(
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            result,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
     rendered = make_html(
         transcript_path,
         rows,
@@ -2508,10 +2543,7 @@ def main():
         speaker_mapping,
     )
 
-    html_path.write_text(
-        rendered,
-        encoding="utf-8",
-    )
+    publish_protocol(json_path, html_path, result, rendered)
 
     log()
     log("=" * 60)
