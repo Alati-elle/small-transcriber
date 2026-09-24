@@ -2,6 +2,11 @@
 
 История восстановлена только по существующим файлам, backup-именам, diff и логам. Не подтверждённые детали не добавлены.
 
+## Unreleased
+
+- Добавлен начальный meeting storage core: SQLite schema v1, UUIDv4 для встреч и runs, выбор активной версии анализа и проверка managed paths.
+- Storage core пока не подключён к транскрипции и GUI; production flow не изменён.
+
 ## 2026-09-23 — baseline consolidation
 
 - Текущие production-исходники скопированы в `src/` без изменения содержимого.

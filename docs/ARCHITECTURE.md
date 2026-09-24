@@ -110,3 +110,7 @@
 - сетевой доступ к Gemini API.
 
 Дополнительных Python-пакетов baseline не требует.
+
+## Meeting storage (feature branch)
+
+[MEETING_STORAGE.md](MEETING_STORAGE.md) описывает реализованный storage core для истории встреч и версий анализа. Он пока не подключён к production flow, описанному выше; текущий GUI и pipeline продолжают работать без SQLite.
