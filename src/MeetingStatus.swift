@@ -20,49 +20,33 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     var startDate = Date()
     var elapsedTimer: Timer?
-    var logTimer: Timer?
 
     var currentProcess: Process?
-    var currentLogHandle: FileHandle?
-    var currentLogPath: String?
+    var processExitCode: Int32?
+    var stdoutFinished = false
+    var stderrFinished = false
+    var didFinish = false
+    let stdoutLines = JSONLineBuffer()
+    let events = ManagedPipelineEvents()
+    var finalResult: ManagedPipelineResult?
 
     let fm = FileManager.default
 
     let home = FileManager.default.homeDirectoryForCurrentUser.path
 
-    lazy var transcribeScript =
-        home + "/.local/bin/gemini_transcribe_meeting.py"
-
-    lazy var protocolScript =
-        home + "/.local/bin/gemini_make_protocol.py"
+    lazy var pipelineScript: String = {
+        #if DEBUG
+        if let override = ProcessInfo.processInfo.environment["SMALL_TRANSCRIBER_PIPELINE_SCRIPT"],
+           !override.isEmpty { return override }
+        #endif
+        return home + "/.local/bin/meeting_pipeline.py"
+    }()
 
     lazy var inputURL = URL(fileURLWithPath: inputPath)
 
     lazy var stem: String = {
         inputURL.deletingPathExtension().lastPathComponent
     }()
-
-    lazy var inputDir: String = {
-        inputURL.deletingLastPathComponent().path
-    }()
-
-    lazy var outputDir =
-        inputDir + "/" + stem
-
-    lazy var transcribeLog =
-        outputDir + "/transcribe.log"
-
-    lazy var protocolLog =
-        outputDir + "/protocol.log"
-
-    lazy var transcriptPath =
-        outputDir + "/" + stem + "_ПОЛНАЯ_РАСШИФРОВКА.txt"
-
-    lazy var protocolJSON =
-        outputDir + "/" + stem + "_ПРОТОКОЛ.json"
-
-    lazy var protocolHTML =
-        outputDir + "/" + stem + "_ПРОТОКОЛ.html"
 
 
     init(inputPath: String) {
@@ -76,19 +60,6 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     ) {
         buildWindow()
 
-        do {
-            try fm.createDirectory(
-                atPath: outputDir,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            finishError(
-                "Не удалось создать папку результатов.",
-                logPath: nil
-            )
-            return
-        }
-
         startDate = Date()
 
         elapsedTimer = Timer.scheduledTimer(
@@ -98,7 +69,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.updateElapsed()
         }
 
-        startTranscription()
+        startPipeline()
     }
 
 
@@ -106,6 +77,12 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ sender: NSApplication
     ) -> Bool {
         return true
+    }
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        return currentProcess == nil ? .terminateNow : .terminateCancel
     }
 
 
@@ -342,332 +319,120 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
 
-    func startTranscription() {
-
-        phaseLabel.stringValue =
-            "Этап 1 из 2 — Расшифровка"
-
-        statusLabel.stringValue =
-            "Подготавливаю аудио…"
-
-        runPython(
-            script: transcribeScript,
-            arguments: [inputPath],
-            logPath: transcribeLog
-        ) { [weak self] exitCode in
-
-            guard let self = self else { return }
-
-            if exitCode != 0 {
-                self.finishError(
-                    "Не удалось создать расшифровку.",
-                    logPath: self.transcribeLog
-                )
-                return
-            }
-
-            guard self.fileExistsAndNotEmpty(
-                self.transcriptPath
-            ) else {
-                self.finishError(
-                    "Скрипт завершился, но итоговая расшифровка не найдена.",
-                    logPath: self.transcribeLog
-                )
-                return
-            }
-
-            self.startProtocol()
-        }
-    }
-
-
-    func startProtocol() {
-
-        phaseLabel.stringValue =
-            "Этап 2 из 2 — Создание протокола"
-
-        statusLabel.stringValue =
-            "Подготавливаю расшифровку для Gemini…"
-
-        runPython(
-            script: protocolScript,
-            arguments: [transcriptPath],
-            logPath: protocolLog
-        ) { [weak self] exitCode in
-
-            guard let self = self else { return }
-
-            if exitCode != 0 {
-                let previousProtocolExists =
-                    self.fileExistsAndNotEmpty(self.protocolJSON) &&
-                    self.fileExistsAndNotEmpty(self.protocolHTML)
-                self.finishError(
-                    previousProtocolExists
-                        ? "Новый анализ не завершился. Предыдущий протокол сохранён."
-                        : "Протокол создать не удалось.",
-                    logPath: self.protocolLog
-                )
-                self.openProtocolButton.isHidden = !previousProtocolExists
-                return
-            }
-
-            guard
-                self.fileExistsAndNotEmpty(
-                    self.protocolJSON
-                ),
-                self.fileExistsAndNotEmpty(
-                    self.protocolHTML
-                )
-            else {
-                self.finishError(
-                    "Генератор завершился, но файлы протокола не найдены.",
-                    logPath: self.protocolLog
-                )
-                return
-            }
-
-            self.finishSuccess()
-        }
-    }
-
-
-    func runPython(
-        script: String,
-        arguments: [String],
-        logPath: String,
-        completion: @escaping (Int32) -> Void
-    ) {
-
-        currentLogPath = logPath
-
-        fm.createFile(
-            atPath: logPath,
-            contents: Data()
-        )
-
-        guard let handle =
-            FileHandle(forWritingAtPath: logPath)
-        else {
-            finishError(
-                "Не удалось открыть лог для записи.",
-                logPath: nil
-            )
-            return
-        }
-
-        currentLogHandle = handle
-
+    func startPipeline() {
         let process = Process()
-        process.executableURL =
-            URL(fileURLWithPath: "/usr/bin/python3")
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        var arguments = [pipelineScript, "run", inputPath]
+        #if DEBUG
+        if let root = ProcessInfo.processInfo.environment["SMALL_TRANSCRIBER_STORAGE_ROOT"],
+           !root.isEmpty {
+            arguments += ["--storage-root", root]
+        }
+        #endif
+        process.arguments = arguments
 
-        process.arguments =
-            [script] + arguments
-
-        process.standardOutput = handle
-        process.standardError = handle
-
+        let stdout = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderrPipe
         currentProcess = process
 
-        startWatchingLog(logPath)
-
-        process.terminationHandler = {
-            [weak self] process in
-
+        process.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async {
-
-                guard let self = self else { return }
-
-                self.logTimer?.invalidate()
-                self.logTimer = nil
-
-                try? self.currentLogHandle?.close()
-                self.currentLogHandle = nil
-                self.currentProcess = nil
-
-                self.updateStatusFromLog(logPath)
-
-                completion(
-                    process.terminationStatus
-                )
+                self?.processExitCode = finished.terminationReason == .exit
+                    ? finished.terminationStatus : -1
+                self?.finishIfReady()
             }
         }
 
         do {
             try process.run()
         } catch {
-            try? handle.close()
+            currentProcess = nil
+            try? stdout.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            finishError("Не удалось запустить обработку встречи.", logPath: nil)
+            return
+        }
+        try? stdout.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
 
-            finishError(
-                "Не удалось запустить Python: \(error.localizedDescription)",
-                logPath: logPath
-            )
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while true {
+                let chunk = stdout.fileHandleForReading.availableData
+                if chunk.isEmpty { break }
+                DispatchQueue.main.async { self?.receiveStdout(chunk) }
+            }
+            DispatchQueue.main.async {
+                self?.flushStdout()
+                self?.stdoutFinished = true
+                self?.finishIfReady()
+            }
+        }
+
+        // Drain diagnostics separately; child logs are provided by the orchestrator.
+        DispatchQueue.global(qos: .utility).async {
+            while !stderrPipe.fileHandleForReading.availableData.isEmpty {}
+            DispatchQueue.main.async { [weak self] in
+                self?.stderrFinished = true
+                self?.finishIfReady()
+            }
         }
     }
 
-
-    func startWatchingLog(_ path: String) {
-
-        logTimer?.invalidate()
-
-        logTimer = Timer.scheduledTimer(
-            withTimeInterval: 0.7,
-            repeats: true
-        ) { [weak self] _ in
-            self?.updateStatusFromLog(path)
+    func receiveStdout(_ chunk: Data) {
+        for line in stdoutLines.append(chunk) {
+            applyEvent(line)
         }
     }
 
-
-    func updateStatusFromLog(_ path: String) {
-
-        guard
-            let data = fm.contents(atPath: path),
-            let text = String(
-                data: data,
-                encoding: .utf8
-            )
-        else {
-            return
+    func flushStdout() {
+        for line in stdoutLines.finish() {
+            applyEvent(line)
         }
-
-        let lines = text
-            .components(separatedBy: .newlines)
-            .filter {
-                !$0.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                ).isEmpty
-            }
-
-        guard let raw = lines.last else {
-            return
-        }
-
-        statusLabel.stringValue =
-            humanStatus(raw)
     }
 
-
-    func humanStatus(_ rawLine: String) -> String {
-
-        var line = rawLine
-
-        if line.hasPrefix("["),
-           let end = line.firstIndex(of: "]") {
-            line = String(
-                line[line.index(after: end)...]
-            )
-            .trimmingCharacters(in: .whitespaces)
+    func applyEvent(_ line: String) {
+        switch events.consume(line) {
+        case .started:
+            statusLabel.stringValue = "Подготавливаю обработку…"
+        case .transcriptionStarted:
+            phaseLabel.stringValue = "Этап 1 из 2 — Расшифровка"
+            statusLabel.stringValue = "Подготавливаю аудио…"
+        case .transcriptionSucceeded:
+            statusLabel.stringValue = "Расшифровка создана."
+        case .analysisStarted:
+            phaseLabel.stringValue = "Этап 2 из 2 — Создание протокола"
+            statusLabel.stringValue = "Подготавливаю протокол…"
+        case .analysisSucceeded:
+            statusLabel.stringValue = "Протокол создан."
+        case .failed(let message):
+            statusLabel.stringValue = message
+        case .successReceived, .ignored:
+            break
+        case .malformed:
+            fputs("Ignored malformed pipeline event\n", stderr)
         }
+    }
 
-        let lower = line.lowercased()
-
-        if lower.contains("rate limit") ||
-           lower.contains("429") {
-
-            if let range =
-                line.range(
-                    of: #"через \d+ сек"#,
-                    options: .regularExpression
-                ) {
-
-                return
-                    "Достигнут временный лимит Gemini. Повтор " +
-                    line[range]
-            }
-
-            return
-                "Достигнут временный лимит Gemini. Жду повторную попытку…"
+    func finishIfReady() {
+        guard !didFinish, let exitCode = processExitCode, stdoutFinished, stderrFinished else { return }
+        didFinish = true
+        processExitCode = nil
+        currentProcess = nil
+        switch events.complete(exitCode: exitCode, files: fm) {
+        case .success(let result):
+            finalResult = result
+            finishSuccess()
+        case .failure(let message):
+            finishError(message, logPath: events.currentLogPath)
         }
-
-        if lower.contains("503") {
-
-            if let range =
-                line.range(
-                    of: #"через \d+ сек"#,
-                    options: .regularExpression
-                ) {
-
-                return
-                    "Gemini сейчас перегружен. Повтор " +
-                    line[range]
-            }
-
-            if lower.contains("перехожу") ||
-               lower.contains("fallback") {
-
-                return
-                    "Gemini перегружен. Переключаюсь на резервную модель…"
-            }
-
-            return
-                "Gemini сейчас перегружен. Повторяю запрос…"
-        }
-
-        if lower.contains(
-            "нормализация спикеров"
-        ) {
-            return
-                "Проверяю, какие номера спикеров относятся к одним и тем же людям…"
-        }
-
-        if lower.contains(
-            "определение имён"
-        ) {
-            return
-                "Пытаюсь определить имена участников по тексту встречи…"
-        }
-
-        if lower.contains("gemini: батч") {
-            return
-                "Создаю структурированный протокол встречи…"
-        }
-
-        if lower.contains(
-            "склеиваю части"
-        ) {
-            return
-                "Склеиваю части расшифровки…"
-        }
-
-        if lower.contains(
-            "загрузка в gemini"
-        ) {
-            return
-                "Отправляю аудио в Gemini…"
-        }
-
-        if lower.contains(
-            "json уже существует"
-        ) {
-            return
-                "Использую сохранённый результат Gemini…"
-        }
-
-        if lower.contains(
-            "протокол готов"
-        ) {
-            return
-                "Протокол создан."
-        }
-
-        if lower.contains("готово") {
-            return
-                "Расшифровка создана."
-        }
-
-        if line.count > 180 {
-            return String(line.prefix(177)) + "…"
-        }
-
-        return line
     }
 
 
     func finishSuccess() {
 
         elapsedTimer?.invalidate()
-        logTimer?.invalidate()
 
         spinner.stopAnimation(nil)
         spinner.isHidden = true
@@ -702,33 +467,23 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     ) {
 
         elapsedTimer?.invalidate()
-        logTimer?.invalidate()
-
-        currentLogPath = logPath
 
         spinner.stopAnimation(nil)
         spinner.isHidden = true
 
         phaseLabel.stringValue = "Не удалось завершить"
 
-        var detail = message
-
-        if
-            let logPath = logPath,
-            let lastError =
-                extractLastError(logPath) {
-
-            detail += "\n\n" + lastError
-        }
-
-        statusLabel.stringValue = detail
+        statusLabel.stringValue = message
 
         openProtocolButton.isHidden = true
-        openFolderButton.isHidden = false
+        var isDirectory: ObjCBool = false
+        openFolderButton.isHidden = !(events.meetingDir.map {
+            fm.fileExists(atPath: $0, isDirectory: &isDirectory) && isDirectory.boolValue
+        } ?? false)
         closeButton.isHidden = false
 
         openLogButton.isHidden =
-            (logPath == nil)
+            logPath.map { !fm.fileExists(atPath: $0) } ?? true
 
         window.standardWindowButton(
             .closeButton
@@ -744,78 +499,33 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
 
-    func extractLastError(
-        _ path: String
-    ) -> String? {
-
-        guard
-            let text = try? String(
-                contentsOfFile: path,
-                encoding: .utf8
-            )
-        else {
-            return nil
-        }
-
-        let lines = text
-            .components(separatedBy: .newlines)
-            .filter {
-                !$0.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                ).isEmpty
-            }
-
-        guard let last = lines.last else {
-            return nil
-        }
-
-        if last.count > 240 {
-            return String(last.prefix(237)) + "…"
-        }
-
-        return last
-    }
-
-
-    func fileExistsAndNotEmpty(
-        _ path: String
-    ) -> Bool {
-
-        guard
-            let attrs =
-                try? fm.attributesOfItem(
-                    atPath: path
-                ),
-            let size = attrs[.size] as? NSNumber
-        else {
-            return false
-        }
-
-        return size.intValue > 0
-    }
-
-
     @objc func openProtocol() {
-        NSWorkspace.shared.open(
-            URL(fileURLWithPath: protocolHTML)
-        )
+        guard let path = finalResult?.activeHTMLPath,
+              let attributes = try? fm.attributesOfItem(atPath: path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 0 else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
 
     @objc func openFolder() {
-        NSWorkspace.shared.open(
-            URL(fileURLWithPath: outputDir)
-        )
+        guard let path = finalResult?.meetingDir ?? events.meetingDir else { return }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
 
     @objc func openLog() {
 
         guard
-            let path = currentLogPath
+            let path = events.currentLogPath
         else {
             return
         }
+        guard fm.fileExists(atPath: path) else { return }
 
         NSWorkspace.shared.open(
             URL(fileURLWithPath: path)
@@ -835,24 +545,24 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.terminate(nil)
         }
     }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        return currentProcess == nil
+    }
 }
 
 
-guard CommandLine.arguments.count >= 2 else {
-    fputs(
-        "Usage: gemini_meeting_gui <audio-file>\n",
-        stderr
-    )
-    exit(2)
+@main
+struct MeetingMain {
+    static func main() {
+        guard CommandLine.arguments.count >= 2 else {
+            fputs("Usage: gemini_meeting_gui <audio-file>\n", stderr)
+            exit(2)
+        }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let controller = MeetingApp(inputPath: CommandLine.arguments[1])
+        app.delegate = controller
+        app.run()
+    }
 }
-
-let inputPath = CommandLine.arguments[1]
-
-let app = NSApplication.shared
-app.setActivationPolicy(.regular)
-
-let controller =
-    MeetingApp(inputPath: inputPath)
-
-app.delegate = controller
-app.run()

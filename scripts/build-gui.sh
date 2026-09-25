@@ -3,6 +3,7 @@ set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 source_file="$project_root/src/MeetingStatus.swift"
+events_file="$project_root/src/ManagedPipelineEvents.swift"
 output_dir="$project_root/dist"
 output_file="$output_dir/gemini_meeting_gui"
 build_tmp=$(mktemp -d "/private/tmp/small-transcriber-swift.XXXXXX")
@@ -17,6 +18,7 @@ mkdir -p "$output_dir" "$build_tmp/module-cache"
 xcrun swiftc \
     -module-cache-path "$build_tmp/module-cache" \
     "$source_file" \
+    "$events_file" \
     -o "$output_file"
 
 file "$output_file" | grep -q 'x86_64'

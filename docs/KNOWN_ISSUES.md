@@ -10,6 +10,8 @@ Production legacy protocol создаётся во временном катал
 
 Source orchestrator сохраняет staging/log/cache при сбое. Принудительное завершение может оставить run со статусом `running`; автоматическая пометка `interrupted` отложена до появления ownership lock, чтобы не затронуть параллельный активный процесс. Если сбой случится после publication и до SQLite update, каталог и статус могут временно расходиться; автоматический repair пока отсутствует.
 
+Source Swift GUI блокирует штатное закрытие во время активного orchestrator process, но принудительное завершение приложения или ОС по-прежнему может оставить running run. Source GUI не предлагает прежний legacy protocol рядом с audio при ошибке; re-analysis/history позже определят UX для previous active. Установленный production GUI пока работает по legacy flow.
+
 ## P1 — legacy cache не связан с содержимым исходного аудио
 
 В production legacy flow chunks и Gemini JSON повторно используются по ожидаемому имени и базовой проверке содержимого JSON. Manifest там не используется.

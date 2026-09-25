@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- Source Swift GUI подключён к одному managed orchestrator process и его JSON Lines progress; итоговые пути берутся из события. Изменение ещё не установлено в production.
 - Добавлен source managed meeting pipeline orchestrator: SQLite lifecycle, изолированные run directories, проверка и публикация transcript/JSON/HTML, JSON Lines progress. К production Swift GUI ещё не подключён.
 - В protocol generator добавлен explicit managed-output mode с caller-provided пустым staging-каталогом и проверкой пары JSON/HTML перед публикацией. Legacy behavior сохранён; к production GUI режим пока не подключён.
 - Добавлена проверка provenance для managed transcription cache: versioned `manifest.json`, отдельные generations и атомарная запись cache-файлов. Legacy cache не изменён.

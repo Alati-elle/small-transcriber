@@ -117,4 +117,4 @@
 
 Source-версия transcriber также поддерживает явный managed-output mode; production flow выше по-прежнему использует legacy-вызов.
 
-В development source-версии `src/meeting_pipeline.py` теперь соединяет `MeetingStore`, managed transcriber и managed protocol generator: создаёт записи SQLite, публикует проверенные run directories одним rename и выбирает active analysis. Он выдаёт JSON Lines для будущего GUI. Установленные launcher/Swift GUI всё ещё вызывают два legacy CLI напрямую; installer orchestrator пока не разворачивает.
+В development source-версии `src/meeting_pipeline.py` соединяет `MeetingStore`, managed transcriber и managed protocol generator: создаёт записи SQLite, публикует проверенные run directories одним rename и выбирает active analysis. Source Swift GUI теперь запускает один orchestrator process, читает JSON Lines stdout для progress и получает итоговые пути из `pipeline_succeeded`. Swift не обращается к SQLite и не строит managed paths. Установленные launcher/GUI всё ещё используют два legacy CLI; installer orchestrator пока не разворачивает.

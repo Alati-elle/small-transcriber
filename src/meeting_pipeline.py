@@ -99,6 +99,8 @@ def execute(audio, root=None, transcriber=None, protocol=None):
     phase = "input"
     store = None
     current_run = None
+    current_log_path = None
+    meeting_dir = None
     try:
         source = Path(audio).expanduser().resolve(strict=True)
         if not source.is_file():
@@ -125,13 +127,15 @@ def execute(audio, root=None, transcriber=None, protocol=None):
         cache = trans_dir / "cache"
         private_dir(staging)
         private_dir(cache)
-        emit("pipeline_started", **ids)
-        emit("transcription_started", phase="transcription", status="running", **ids)
+        current_log_path = trans_dir / "transcribe.log"
+        emit("pipeline_started", meeting_dir=str(meeting_dir), **ids)
+        emit("transcription_started", phase="transcription", status="running",
+             current_log_path=str(current_log_path), **ids)
 
         phase = "transcription"
         trans_script = Path(transcriber) if transcriber else HERE / "gemini_transcribe_meeting.py"
         if run_child(trans_script, [source, "--output-dir", staging, "--cache-dir", cache,
-                                    "--expected-source-sha256", source_hash], trans_dir / "transcribe.log"):
+                                    "--expected-source-sha256", source_hash], current_log_path):
             raise PipelineError(phase, "failed", "Transcriber exited unsuccessfully")
         transcript_name = source.stem + "_ПОЛНАЯ_РАСШИФРОВКА.txt"
         transcript_hash = checked_file(staging / transcript_name)
@@ -148,6 +152,7 @@ def execute(audio, root=None, transcriber=None, protocol=None):
         emit("transcription_succeeded", phase="transcription", status="succeeded", **ids)
 
         phase = "storage"
+        current_log_path = None
         analysis_id = store.create_analysis_run(meeting_id, trans_id)
         ids["analysis_run_id"] = analysis_id
         current_run = ("analysis", analysis_id)
@@ -155,12 +160,14 @@ def execute(audio, root=None, transcriber=None, protocol=None):
         private_dir(analysis_dir)
         analysis_staging = analysis_dir / ".staging"
         private_dir(analysis_staging)
-        emit("analysis_started", phase="analysis", status="running", **ids)
+        current_log_path = analysis_dir / "protocol.log"
+        emit("analysis_started", phase="analysis", status="running",
+             current_log_path=str(current_log_path), **ids)
 
         phase = "analysis"
         protocol_script = Path(protocol) if protocol else HERE / "gemini_make_protocol.py"
         if run_child(protocol_script, [transcript, "--output-dir", analysis_staging],
-                     analysis_dir / "protocol.log"):
+                     current_log_path):
             raise PipelineError(phase, "failed", "Protocol generator exited unsuccessfully")
         if checked_file(transcript) != transcript_hash:
             raise PipelineError(phase, "incomplete", "Transcript changed during analysis")
@@ -210,7 +217,12 @@ def execute(audio, root=None, transcriber=None, protocol=None):
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as update_error:
                 print("Could not update run status: {}".format(type(update_error).__name__), file=sys.stderr)
         print("Pipeline {}: {}".format(phase, type(error).__name__), file=sys.stderr)
-        emit("pipeline_failed", phase=phase, status=kind, **ids)
+        fields = dict(ids)
+        if meeting_dir is not None:
+            fields["meeting_dir"] = str(meeting_dir)
+        if current_log_path is not None:
+            fields["current_log_path"] = str(current_log_path)
+        emit("pipeline_failed", phase=phase, status=kind, **fields)
         return 1
     finally:
         os.umask(previous_umask)

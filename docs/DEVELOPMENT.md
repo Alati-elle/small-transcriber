@@ -7,6 +7,7 @@
 - `src/gemini_transcribe_meeting.py`;
 - `src/gemini_make_protocol.py`;
 - `src/meeting_store.py` и `src/meeting_pipeline.py` для managed source flow;
+- `src/ManagedPipelineEvents.swift` для разбора JSON Lines в GUI;
 - `src/MeetingStatus.swift`;
 - `src/main.applescript`.
 
@@ -42,7 +43,17 @@ python3 src/meeting_pipeline.py run AUDIO
 python3 src/meeting_pipeline.py run SYNTHETIC_AUDIO --storage-root TEMP_PRIVATE_DIR
 ```
 
-Без `--storage-root` используется `MeetingStore.DEFAULT_ROOT`. Вызов реальных child scripts использует Gemini; для синтетических integration tests предусмотрены `--transcriber-script` и `--protocol-script`. Orchestrator ищет обычные child scripts рядом со своим файлом и запускает их через тот же `sys.executable`; будущая установка должна положить orchestrator, MeetingStore и оба scripts рядом. Текущий installer этого не делает, GUI не подключён. stdout — только JSON Lines progress/result, stderr — короткая диагностика, подробности child process — в приватных run logs.
+Без `--storage-root` используется `MeetingStore.DEFAULT_ROOT`. Вызов реальных child scripts использует Gemini; для синтетических integration tests предусмотрены `--transcriber-script` и `--protocol-script`. Orchestrator ищет обычные child scripts рядом со своим файлом и запускает их через тот же `sys.executable`; будущая установка должна положить orchestrator, MeetingStore и оба scripts рядом. Текущий installer этого не делает. stdout — только JSON Lines progress/result, stderr — короткая диагностика, подробности child process — в приватных run logs.
+
+Source GUI запускает один `meeting_pipeline.py run AUDIO`. Обычная сборка всегда ищет `~/.local/bin/meeting_pipeline.py` и игнорирует test overrides. Только сборка с `-DDEBUG` читает `SMALL_TRANSCRIBER_PIPELINE_SCRIPT` и `SMALL_TRANSCRIBER_STORAGE_ROOT` (второй передаётся как `--storage-root`); эти переменные нужны для dev/synthetic smoke и не действуют в production binary. Без fake script source GUI вызовет реальный Gemini, поэтому в тестах используйте `tests/fake_meeting_pipeline.py` и временный root. Foundation-only parser и fake subprocess проверяются отдельным Swift harness:
+
+```bash
+test_dir=$(mktemp -d /private/tmp/swift-events.XXXXXX)
+xcrun swiftc src/ManagedPipelineEvents.swift tests/test_managed_pipeline_events.swift -o "$test_dir/events-test"
+"$test_dir/events-test" "$PWD/tests/fake_meeting_pipeline.py" "$PWD/src/MeetingStatus.swift"
+```
+
+`scripts/build-gui.sh` и `scripts/verify-install.sh` собирают оба Swift source-файла. Installer в этом milestone не менялся; будущая установка должна доставить orchestrator, MeetingStore и helper вместе с GUI. Source GUI не установлен в production.
 
 ## Безопасный порядок изменения
 
@@ -68,7 +79,7 @@ python3 src/meeting_pipeline.py run SYNTHETIC_AUDIO --storage-root TEMP_PRIVATE_
 Эквивалентная основная команда:
 
 ```bash
-xcrun swiftc src/MeetingStatus.swift -o dist/gemini_meeting_gui
+xcrun swiftc src/ManagedPipelineEvents.swift src/MeetingStatus.swift -o dist/gemini_meeting_gui
 ```
 
 ## Сборка droplet .app

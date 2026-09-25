@@ -59,6 +59,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([e["event"] for e in events], ["pipeline_started", "transcription_started",
                          "transcription_succeeded", "analysis_started", "analysis_succeeded", "pipeline_succeeded"])
+        self.assertEqual(events[0]["meeting_dir"], events[-1]["meeting_dir"])
+        self.assertEqual(events[1]["current_log_path"], events[-1]["transcribe_log_path"])
+        self.assertEqual(events[3]["current_log_path"], events[-1]["protocol_log_path"])
         self.assertNotIn("SYNTHETIC TRANSCRIPT", result.stdout)
         final = events[-1]
         meeting_id = final["meeting_id"]
@@ -105,6 +108,7 @@ class PipelineTests(unittest.TestCase):
                 _, result, events = self.invoke(name)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events[-1]["status"], expected)
+                self.assertEqual(events[-1]["current_log_path"], events[1]["current_log_path"])
                 store = MeetingStore(self.root)
                 meeting_id = events[-1]["meeting_id"]
                 self.assertEqual(store.list_transcription_runs(meeting_id)[0]["status"], expected)
@@ -133,6 +137,7 @@ class PipelineTests(unittest.TestCase):
                 _, result, events = self.invoke(protocol_script=script)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events[-1]["status"], expected)
+                self.assertEqual(events[-1]["current_log_path"], events[3]["current_log_path"])
                 store = MeetingStore(self.root)
                 meeting_id = events[-1]["meeting_id"]
                 self.assertEqual(store.list_transcription_runs(meeting_id)[0]["status"], "succeeded")

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Этот слой хранит историю встреч, версии анализа и выбор активного протокола. Source-версия `meeting_pipeline.py` теперь связывает SQLite с managed transcriber и protocol generator. Production GUI пока использует legacy flow.
+Этот слой хранит историю встреч, версии анализа и выбор активного протокола. Source-версия `meeting_pipeline.py` связывает SQLite с managed transcriber и protocol generator. Source Swift GUI теперь получает progress и пути через JSON Lines orchestrator; production GUI пока использует legacy flow.
 
 ## Managed root
 
@@ -51,7 +51,7 @@ SQLite `user_version = 1`, три таблицы:
 python3 src/gemini_transcribe_meeting.py AUDIO --output-dir DIR --cache-dir DIR --expected-source-sha256 HEX
 ```
 
-Все три опции обязательны вместе; `--output-dir` включает managed mode. Вызывающий слой задаёт оба каталога: final TXT и `_service/merge_diagnostics.json` находятся в output-dir, chunks и cache — в cache-dir. Каталоги могут уже существовать, совпадать или быть вложенными друг в друга. Существующие symlink-пути отдельных артефактов отклоняются; принадлежность каталогов managed root должен обеспечить будущий orchestrator вместе с MeetingStore. Сам transcriber не записывает SQLite.
+Все три опции обязательны вместе; `--output-dir` включает managed mode. Вызывающий слой задаёт оба каталога: final TXT и `_service/merge_diagnostics.json` находятся в output-dir, chunks и cache — в cache-dir. Каталоги могут уже существовать, совпадать или быть вложенными друг в друга. Существующие symlink-пути отдельных артефактов отклоняются; принадлежность каталогов managed root обеспечивает source orchestrator вместе с MeetingStore. Сам transcriber не записывает SQLite.
 
 SHA-256 source проверяется до обработки и после неё. Новый final TXT сначала готовится во временном файле внутри output-dir и заменяет окончательный файл только после повторной проверки. При ошибке ранее существовавший final TXT сохраняется; cache и диагностика могут остаться как непубликованные материалы. Legacy-вызов `python3 src/gemini_transcribe_meeting.py AUDIO` сохраняет прежние пути и auto-open.
 
@@ -87,13 +87,13 @@ meetings/<meeting-id>/
 
 До публикации вместо `published/` используется `.staging/`. Run IDs, связи, статусы, hashes и active pointer принадлежат SQLite; содержимое — файлам. `published/` не перезаписывается. Проверка/rename каталога и обновление SQLite происходят последовательно, общей filesystem+DB транзакции нет. При сбое child process run получает `failed`, при отсутствии/невалидности outputs, публикации или финализации — `incomplete` (если run ещё `running`). Если active switch падает после успешной записи analysis, analysis остаётся `succeeded`, но не становится active. Staging, cache и logs сохраняются для диагностики.
 
-stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные IDs/phase/status); финальный `pipeline_succeeded` содержит пути к опубликованным outputs и логам. Ошибки дают `pipeline_failed` и ненулевой exit. Transcript, prompt и API key в события не включаются.
+stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные IDs/phase/status); `pipeline_started` передаёт `meeting_dir`, stage events и `pipeline_failed` — `current_log_path`, финальный `pipeline_succeeded` содержит пути к опубликованным outputs и логам. Ошибки дают `pipeline_failed` и ненулевой exit. Transcript, prompt и API key в события не включаются. Source Swift GUI использует эти events и не читает/не пишет SQLite; «Открыть протокол» использует `active_html_path`, «Открыть папку» — `meeting_dir` как контейнер всей встречи.
 
-Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Установленный GUI и installer пока не подключены к orchestrator.
+Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Установленный GUI и installer пока не подключены к orchestrator. Source GUI не ищет прежний legacy protocol рядом с source при ошибке; previous active UX отложен до re-analysis/history.
 
 ## What is not implemented yet
 
-- Swift GUI не подключён к source orchestrator; текущий production flow не меняется.
+- Production Swift GUI не подключён к source orchestrator; текущий установленный flow не меняется.
 - Реальная пользовательская DB пока не создаётся.
 - Recovery running runs, повторный analysis существующей встречи, legacy importer и history UI пока отсутствуют.
 - Speaker overrides и user task state отсутствуют.
@@ -101,7 +101,7 @@ stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные I
 ## Phase 1 roadmap
 
 1. Storage core — реализован в feature branch; проверяется на синтетических данных во временной DB.
-2. Source-интеграция с pipeline и публикация артефактов — реализована; GUI не подключён.
+2. Source-интеграция с pipeline, публикация артефактов и Swift GUI — реализованы; production не установлен.
 3. Версионированный повторный analysis.
 4. Legacy importer для существующих результатов.
 5. History GUI позднее.

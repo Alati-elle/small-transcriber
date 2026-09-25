@@ -7,6 +7,7 @@ home_dir=${HOME:?HOME is not set}
 source_transcribe="$project_root/src/gemini_transcribe_meeting.py"
 source_protocol="$project_root/src/gemini_make_protocol.py"
 source_swift="$project_root/src/MeetingStatus.swift"
+source_events="$project_root/src/ManagedPipelineEvents.swift"
 source_applescript="$project_root/src/main.applescript"
 
 installed_transcribe="$home_dir/.local/bin/gemini_transcribe_meeting.py"
@@ -39,6 +40,7 @@ for path in \
     "$source_transcribe" \
     "$source_protocol" \
     "$source_swift" \
+    "$source_events" \
     "$source_applescript" \
     "$installed_transcribe" \
     "$installed_protocol" \
@@ -109,6 +111,7 @@ mkdir -p "$check_tmp/module-cache"
 if xcrun swiftc \
     -module-cache-path "$check_tmp/module-cache" \
     "$source_swift" \
+    "$source_events" \
     -o "$check_tmp/gemini_meeting_gui"
 then
     pass 'Swift source builds'
