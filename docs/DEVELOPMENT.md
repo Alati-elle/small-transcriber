@@ -25,6 +25,15 @@ python3 src/gemini_transcribe_meeting.py AUDIO \
 
 Managed cache использует `DIR/manifest.json` и `DIR/generations/<id>/`. Manifest записывается атомарно и должен точно совпасть с текущим source, параметрами обработки, моделью, шаблоном запроса и словарём для reuse. Отсутствующий или невалидный manifest создаёт новую generation без удаления старых файлов. Legacy-вызов manifest не создаёт.
 
+Протокол из готовой расшифровки запускается аналогично:
+
+```bash
+python3 src/gemini_make_protocol.py TRANSCRIPT
+python3 src/gemini_make_protocol.py TRANSCRIPT --output-dir EMPTY_STAGING_DIR
+```
+
+Первый вызов сохраняет legacy output рядом с transcript. `--output-dir` включает managed mode: каталог может отсутствовать или быть пустым, но непустой каталог отклоняется до обработки. Это низкоуровневый building block будущего orchestrator; production GUI пока вызывает legacy mode.
+
 ## Безопасный порядок изменения
 
 1. Выполнить `./scripts/verify-install.sh` и сохранить результат.

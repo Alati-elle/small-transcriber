@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import html
 import json
 import os
@@ -2210,7 +2211,7 @@ __TABLE__
 
 
 
-def output_paths(transcript_path):
+def output_paths(transcript_path, output_dir=None):
     suffix = "_ПОЛНАЯ_РАСШИФРОВКА"
 
     stem = transcript_path.stem
@@ -2220,18 +2221,36 @@ def output_paths(transcript_path):
     else:
         base = stem
 
-    json_path = transcript_path.with_name(
-        base + "_ПРОТОКОЛ.json"
-    )
-
-    html_path = transcript_path.with_name(
-        base + "_ПРОТОКОЛ.html"
-    )
+    parent = output_dir if output_dir is not None else transcript_path.parent
+    json_path = parent / (base + "_ПРОТОКОЛ.json")
+    html_path = parent / (base + "_ПРОТОКОЛ.html")
 
     return json_path, html_path
 
 
-def publish_protocol(json_path, html_path, result, rendered):
+def validate_managed_protocol(json_path, html_path, transcript_path):
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        markup = html_path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Не удалось проверить новый протокол") from error
+
+    if (
+        not isinstance(data, dict)
+        or data.get("source_transcript") != str(transcript_path)
+        or not isinstance(data.get("transcript"), list)
+        or not isinstance(data.get("items"), list)
+        or not isinstance(data.get("summary"), dict)
+        or not isinstance(data.get("categories"), list)
+        or not isinstance(data.get("models_used"), list)
+        or data.get("rows_count") != len(data["transcript"])
+        or data.get("items_count") != len(data["items"])
+        or not markup.strip()
+    ):
+        raise RuntimeError("Новый протокол не прошёл проверку JSON/HTML")
+
+
+def publish_protocol(json_path, html_path, result, rendered, managed=False, transcript_path=None):
     with tempfile.TemporaryDirectory(
         prefix=".protocol-", dir=json_path.parent
     ) as staging_dir:
@@ -2245,6 +2264,9 @@ def publish_protocol(json_path, html_path, result, rendered):
 
         if not staged_json.stat().st_size or not staged_html.stat().st_size:
             raise RuntimeError("Новый протокол пуст; предыдущий сохранён")
+
+        if managed:
+            validate_managed_protocol(staged_json, staged_html, transcript_path)
 
         targets = ((staged_json, json_path), (staged_html, html_path))
         backups = {}
@@ -2268,24 +2290,38 @@ def publish_protocol(json_path, html_path, result, rendered):
             raise
 
 
-def main():
-    if len(sys.argv) != 2:
-        raise RuntimeError(
-            "Использование:\n"
-            "gemini_make_protocol.py "
-            "\"..._ПОЛНАЯ_РАСШИФРОВКА.txt\""
-        )
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Создать протокол из полной расшифровки")
+    parser.add_argument("transcript", help="файл *_ПОЛНАЯ_РАСШИФРОВКА.txt")
+    parser.add_argument("--output-dir", type=Path, help="пустой staging-каталог (managed mode)")
+    return parser.parse_args(argv)
 
-    transcript_path = (
-        Path(sys.argv[1])
-        .expanduser()
-        .resolve()
-    )
+
+def prepare_output_dir(transcript_path, output_dir):
+    if output_dir is None:
+        return transcript_path.parent
+    target = output_dir.expanduser().resolve()
+    if target == transcript_path.parent:
+        raise RuntimeError("Managed output-dir должен отличаться от каталога расшифровки")
+    if target.exists():
+        if not target.is_dir() or any(target.iterdir()):
+            raise RuntimeError("Managed output-dir должен быть пустым staging-каталогом")
+    else:
+        target.mkdir(parents=True)
+    return target
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+    transcript_path = Path(args.transcript).expanduser().resolve()
 
     if not transcript_path.is_file():
         raise RuntimeError(
             f"Файл не найден: {transcript_path}"
         )
+
+    managed = args.output_dir is not None
+    output_dir = prepare_output_dir(transcript_path, args.output_dir)
 
     log("=" * 60)
     log("GEMINI MEETING PROTOCOL")
@@ -2483,11 +2519,9 @@ def main():
 
     summary = build_summary(all_items)
 
-    json_path, html_path = output_paths(
-        transcript_path
-    )
+    json_path, html_path = output_paths(transcript_path, output_dir)
 
-    service_dir = transcript_path.parent / "_service"
+    service_dir = output_dir / "_service"
     service_dir.mkdir(exist_ok=True)
 
     speaker_normalization_path = (
@@ -2542,6 +2576,20 @@ def main():
         summary,
         speaker_mapping,
     )
+
+    if managed:
+        log(f"JSON: {json_path}")
+        log(f"HTML: {html_path}")
+        try:
+            publish_protocol(
+                json_path, html_path, result, rendered,
+                managed=True, transcript_path=transcript_path,
+            )
+        except BaseException:
+            json_path.unlink(missing_ok=True)
+            html_path.unlink(missing_ok=True)
+            raise
+        return
 
     publish_protocol(json_path, html_path, result, rendered)
 

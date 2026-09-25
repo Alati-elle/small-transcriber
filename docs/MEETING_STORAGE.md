@@ -59,7 +59,15 @@ Managed cache provenance реализован отдельно от storage core
 
 Manifest атомарно указывает на `--cache-dir/generations/<id>/`. Только точное совпадение identity разрешает reuse файлов этой generation. При отсутствии, повреждении или несовпадении manifest создаётся новая generation; старые файлы не удаляются и не используются. Частичный cache с совпадающим manifest может дозаполняться. Legacy cache работает без manifest и не менялся.
 
-Orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy. Manifest хранит только provenance cache и не заменяет SQLite.
+Protocol generator также поддерживает отдельный managed-вызов:
+
+```text
+python3 src/gemini_make_protocol.py TRANSCRIPT --output-dir DIR
+```
+
+`DIR` задаёт вызывающий слой как новый или уже существующий **пустой** staging-каталог. Generator пишет `*_ПРОТОКОЛ.json`, `*_ПРОТОКОЛ.html` и `_service/speaker_normalization.json` только внутрь него. Непустой каталог, включая прежнюю пару или один файл, отклоняется до обработки; предыдущая хорошая пара не изменяется. Оба новых файла проверяются до публикации; при обычной ошибке публикации частичная пара убирается. Внешнюю атомарную публикацию всего analysis run directory позднее выполнит orchestrator.
+
+Generator не записывает SQLite, не переключает active analysis и не создаёт run IDs. Orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy. Manifest хранит только provenance cache и не заменяет SQLite.
 
 ## What is not implemented yet
 
