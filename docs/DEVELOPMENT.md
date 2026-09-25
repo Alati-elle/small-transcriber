@@ -23,6 +23,8 @@ python3 src/gemini_transcribe_meeting.py AUDIO \
 
 Первый вызов сохраняет legacy layout рядом с source и auto-open. Во втором вызове `--output-dir` включает managed mode, `--cache-dir` задаёт каталог chunks/cache, а `--expected-source-sha256` передаёт 64-символьный hex SHA-256 source. Все три опции обязательны вместе. Managed-вызов пока является низкоуровневым building block для будущего orchestrator, а не пользовательским production workflow. Для тестов используйте только синтетические файлы; эти команды без mock вызывают ffmpeg и Gemini.
 
+Managed cache использует `DIR/manifest.json` и `DIR/generations/<id>/`. Manifest записывается атомарно и должен точно совпасть с текущим source, параметрами обработки, моделью, шаблоном запроса и словарём для reuse. Отсутствующий или невалидный manifest создаёт новую generation без удаления старых файлов. Legacy-вызов manifest не создаёт.
+
 ## Безопасный порядок изменения
 
 1. Выполнить `./scripts/verify-install.sh` и сохранить результат.

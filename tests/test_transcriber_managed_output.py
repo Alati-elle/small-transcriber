@@ -44,7 +44,7 @@ class ManagedOutputTests(unittest.TestCase):
         module = self.module
         paths = []
 
-        def split(source, directory, managed=False):
+        def split(source, directory, managed=False, expected_source_sha=None):
             paths.append(directory)
             chunk = directory / "meeting_chunk001.m4a"
             chunk.write_bytes(b"synthetic chunk")
@@ -61,6 +61,7 @@ class ManagedOutputTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(module, "FFMPEG", str(self.source)))
             stack.enter_context(mock.patch.object(module, "FFPROBE", str(self.source)))
             stack.enter_context(mock.patch.object(module, "get_key", return_value="fake"))
+            stack.enter_context(mock.patch.object(module, "load_vocabulary", return_value=[]))
             stack.enter_context(mock.patch.object(module, "split_audio", side_effect=split))
             stack.enter_context(mock.patch.object(module, "upload_audio", return_value="fake-uri"))
             stack.enter_context(mock.patch.object(module, "transcribe", return_value={"candidates": [{}]}))
@@ -84,10 +85,12 @@ class ManagedOutputTests(unittest.TestCase):
 
     def test_managed_paths_diagnostics_and_no_source_adjacent_artifacts(self):
         paths, opened = self.run_synthetic(self.managed_args())
-        self.assertEqual(paths, [self.cache])
-        self.assertTrue((self.cache / "meeting_chunk001.m4a").is_file())
-        self.assertTrue((self.cache / "meeting_chunk001_gemini.json").is_file())
-        self.assertTrue((self.cache / "meeting_chunk001_transcript.txt").is_file())
+        manifest = json.loads((self.cache / "manifest.json").read_text())
+        generation = self.cache / "generations" / manifest["generation"]
+        self.assertEqual(paths, [generation])
+        self.assertTrue((generation / "meeting_chunk001.m4a").is_file())
+        self.assertTrue((generation / "meeting_chunk001_gemini.json").is_file())
+        self.assertTrue((generation / "meeting_chunk001_transcript.txt").is_file())
         self.assertTrue((self.output / "meeting_ПОЛНАЯ_РАСШИФРОВКА.txt").is_file())
         self.assertEqual(json.loads((self.output / "_service/merge_diagnostics.json").read_text())["boundaries"], [])
         self.assertEqual(list(self.source.parent.iterdir()), [self.source])
@@ -132,6 +135,7 @@ class ManagedOutputTests(unittest.TestCase):
         self.assertFalse((self.output / "meeting_ПОЛНАЯ_РАСШИФРОВКА.txt").exists())
         self.assertEqual(list(self.output.glob(".transcript-*")), [])
         self.assertTrue((self.output / "_service/merge_diagnostics.json").is_file())
+        self.assertFalse((self.cache / "manifest.json").exists())
         self.assertEqual(list(self.source.parent.iterdir()), [self.source])
 
     def test_previous_final_survives_post_hash_failure(self):
@@ -153,7 +157,8 @@ class ManagedOutputTests(unittest.TestCase):
             return check(*args)
 
         def observed_replace(*args):
-            events.append("publish")
+            if args[1] == self.output / "meeting_ПОЛНАЯ_РАСШИФРОВКА.txt":
+                events.append("publish")
             return replace(*args)
 
         with mock.patch.object(self.module, "check_source_hash", side_effect=observed_check):
@@ -223,9 +228,13 @@ class ManagedOutputTests(unittest.TestCase):
         self.assertEqual(list(self.source.parent.iterdir()), [self.source])
 
     def test_cache_artifact_symlink_cannot_write_beside_source(self):
-        self.cache.mkdir(parents=True)
+        self.run_synthetic(self.managed_args())
+        manifest = json.loads((self.cache / "manifest.json").read_text())
+        generation = self.cache / "generations" / manifest["generation"]
         adjacent = self.source.parent / "outside.json"
-        (self.cache / "meeting_chunk001_gemini.json").symlink_to(adjacent)
+        cached_json = generation / "meeting_chunk001_gemini.json"
+        cached_json.unlink()
+        cached_json.symlink_to(adjacent)
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             self.run_synthetic(self.managed_args())
         self.assertFalse(adjacent.exists())

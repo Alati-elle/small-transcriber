@@ -55,7 +55,11 @@ python3 src/gemini_transcribe_meeting.py AUDIO --output-dir DIR --cache-dir DIR 
 
 SHA-256 source проверяется до обработки и после неё. Новый final TXT сначала готовится во временном файле внутри output-dir и заменяет окончательный файл только после повторной проверки. При ошибке ранее существовавший final TXT сохраняется; cache и диагностика могут остаться как непубликованные материалы. Legacy-вызов `python3 src/gemini_transcribe_meeting.py AUDIO` сохраняет прежние пути и auto-open.
 
-Full cache provenance, orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy.
+Managed cache provenance реализован отдельно от storage core. `--cache-dir/manifest.json` содержит versioned identity: SHA-256 и размер source, backend/model/API, параметры chunk/overlap/step, SHA-256 ffmpeg/ffprobe и параметры audio preprocessing, SHA-256 фактического шаблона Gemini-запроса и нормализованного словаря, а также cache format version. Полные prompt и словарь в manifest не сохраняются.
+
+Manifest атомарно указывает на `--cache-dir/generations/<id>/`. Только точное совпадение identity разрешает reuse файлов этой generation. При отсутствии, повреждении или несовпадении manifest создаётся новая generation; старые файлы не удаляются и не используются. Частичный cache с совпадающим manifest может дозаполняться. Legacy cache работает без manifest и не менялся.
+
+Orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy. Manifest хранит только provenance cache и не заменяет SQLite.
 
 ## What is not implemented yet
 

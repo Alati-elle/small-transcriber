@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import uuid
 import difflib
 from pathlib import Path
 from datetime import datetime
@@ -17,6 +18,9 @@ CHUNK = 360
 OVERLAP = 30
 STEP = CHUNK - OVERLAP
 MODEL = "gemini-3.5-transcribe"
+CACHE_SCHEMA_VERSION = 1
+CACHE_FORMAT_VERSION = 1
+FFMPEG_AUDIO_ARGS = ["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "64k"]
 
 VOCABULARY_FILE = (
     Path.home()
@@ -134,7 +138,7 @@ def reject_symlink(path):
         raise RuntimeError(f"Managed artifact is a symlink: {path}")
 
 
-def split_audio(source, outdir, managed=False):
+def split_audio(source, outdir, managed=False, expected_source_sha=None):
     total = duration(source)
 
     log(f"Длительность: {total:.1f} сек.")
@@ -161,20 +165,30 @@ def split_audio(source, outdir, managed=False):
                 f"{start:.0f}s → {start + length:.0f}s"
             )
 
-            run([
-                FFMPEG,
-                "-y",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-ss", str(start),
-                "-i", str(source),
-                "-t", str(length),
-                "-map", "0:a:0",
-                "-vn",
-                "-c:a", "aac",
-                "-b:a", "64k",
-                str(out),
-            ])
+            staged = None
+            if managed:
+                staged = tempfile.NamedTemporaryFile(
+                    dir=outdir, prefix=".chunk-", suffix=".m4a", delete=False
+                )
+                staged.close()
+            try:
+                run([
+                    FFMPEG,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-ss", str(start),
+                    "-i", str(source),
+                    "-t", str(length),
+                    *FFMPEG_AUDIO_ARGS,
+                    str(staged.name) if managed else str(out),
+                ])
+                if managed:
+                    check_source_hash(source, expected_source_sha)
+                    os.replace(staged.name, out)
+            finally:
+                if staged is not None:
+                    Path(staged.name).unlink(missing_ok=True)
 
         chunks.append((out, start))
 
@@ -245,9 +259,7 @@ def upload_audio(path, key):
         )
 
 
-def transcribe(uri, key):
-    vocabulary = load_vocabulary()
-
+def transcription_payload(uri, vocabulary):
     parts = [{
         "fileData": {
             "fileUri": uri,
@@ -283,6 +295,14 @@ def transcribe(uri, key):
             }
         },
     }
+
+    return payload
+
+
+def transcribe(uri, key, vocabulary=None):
+    if vocabulary is None:
+        vocabulary = load_vocabulary()
+    payload = transcription_payload(uri, vocabulary)
 
     attempt = 1
 
@@ -1585,13 +1605,89 @@ def parse_args(argv):
     return args
 
 
-def check_source_hash(source, expected):
+def file_sha256(path):
     digest = hashlib.sha256()
-    with source.open("rb") as stream:
+    with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
-    if digest.hexdigest() != expected.lower():
+    return digest.hexdigest()
+
+
+def check_source_hash(source, expected):
+    if file_sha256(source) != expected.lower():
         raise RuntimeError("SHA-256 исходного файла не совпадает; managed run остановлен")
+
+
+def json_sha256(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def write_json_atomic(path, data):
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=".cache-", delete=False
+    )
+    try:
+        with staged:
+            json.dump(data, staged, ensure_ascii=False, sort_keys=True, indent=2)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(staged.name, path)
+    finally:
+        Path(staged.name).unlink(missing_ok=True)
+
+
+def cache_identity(source, expected_sha, vocabulary):
+    return {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "source_sha256": expected_sha.lower(),
+        "source_size_bytes": source.stat().st_size,
+        "backend": "gemini-generateContent",
+        "model": MODEL,
+        "request_api": API,
+        "upload_api": UPLOAD_API,
+        "chunk_seconds": CHUNK,
+        "overlap_seconds": OVERLAP,
+        "step_seconds": STEP,
+        "audio_preprocessing": {
+            "ffmpeg_sha256": file_sha256(Path(FFMPEG)),
+            "ffprobe_sha256": file_sha256(Path(FFPROBE)),
+            "seek_before_input": True,
+            "audio_args": FFMPEG_AUDIO_ARGS,
+            "output_suffix": ".m4a",
+        },
+        "request_sha256": json_sha256(transcription_payload("<file-uri>", vocabulary)),
+        "vocabulary_sha256": json_sha256(vocabulary),
+    }
+
+
+def prepare_managed_cache(cache_dir, identity):
+    manifest_path = cache_dir / "manifest.json"
+    generations = cache_dir / "generations"
+    reject_symlink(manifest_path)
+    reject_symlink(generations)
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = None
+
+    if isinstance(manifest, dict):
+        generation = manifest.get("generation")
+        if isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{32}", generation):
+            if manifest == {**identity, "generation": generation}:
+                path = generations / generation
+                reject_symlink(path)
+                if path.is_dir():
+                    return path
+
+    generations.mkdir(exist_ok=True)
+    generation = uuid.uuid4().hex
+    path = generations / generation
+    path.mkdir()
+    write_json_atomic(manifest_path, {**identity, "generation": generation})
+    return path
 
 
 def main():
@@ -1621,9 +1717,14 @@ def main():
     if managed:
         reject_symlink(service_dir)
     service_dir.mkdir(exist_ok=True)
-    cache_dir = args.cache_dir.expanduser().resolve() if managed else service_dir
+    cache_root = args.cache_dir.expanduser().resolve() if managed else service_dir
+    cache_dir = cache_root
     if managed:
         cache_dir.mkdir(parents=True, exist_ok=True)
+        vocabulary = load_vocabulary()
+        cache_dir = prepare_managed_cache(
+            cache_dir, cache_identity(source, args.expected_source_sha256, vocabulary)
+        )
 
     log("=" * 60)
     log("GEMINI TRANSCRIBE")
@@ -1631,7 +1732,10 @@ def main():
     log(f"Результат: {outdir}")
     log("=" * 60)
 
-    chunks = split_audio(source, cache_dir, managed=managed)
+    chunks = split_audio(
+        source, cache_dir, managed=managed,
+        expected_source_sha=args.expected_source_sha256 if managed else None,
+    )
 
     chunk_parts = []
 
@@ -1671,15 +1775,13 @@ def main():
             uri = upload_audio(audio, key)
 
             log("Распознавание...")
-            data = transcribe(uri, key)
+            data = transcribe(uri, key, vocabulary) if managed else transcribe(uri, key)
 
-            with json_path.open("w", encoding="utf-8") as f:
-                json.dump(
-                    data,
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+            if managed:
+                write_json_atomic(json_path, data)
+            else:
+                with json_path.open("w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
 
         parts = extract_parts(
             data,
@@ -1769,7 +1871,11 @@ def main():
             )
 
         if managed:
-            check_source_hash(source, args.expected_source_sha256)
+            try:
+                check_source_hash(source, args.expected_source_sha256)
+            except RuntimeError:
+                (cache_root / "manifest.json").unlink(missing_ok=True)
+                raise
     except BaseException:
         if staged_txt is not None:
             Path(staged_txt.name).unlink(missing_ok=True)
