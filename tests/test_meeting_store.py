@@ -45,12 +45,13 @@ class MeetingStoreTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.store.db_path.stat().st_mode), 0o600)
         with self.store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             names = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
-        self.assertTrue({"meetings", "transcription_runs", "analysis_runs"} <= names)
+        self.assertTrue({"meetings", "transcription_runs", "analysis_runs",
+                         "gemini_request_usage", "gemini_quota_observations"} <= names)
 
     def test_existing_insecure_permissions_are_rejected(self):
         self.root.chmod(0o755)

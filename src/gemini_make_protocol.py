@@ -11,6 +11,9 @@ import time
 import tempfile
 from pathlib import Path
 from datetime import datetime
+from gemini_telemetry import (DailyQuotaExhausted, classify, emit as progress_emit,
+                              request as record_request, request_started, request_retry,
+                              stage as progress_stage)
 
 
 MODELS = [
@@ -56,6 +59,10 @@ def log(message=""):
         print(flush=True)
 
 
+class GeminiOverloaded(RuntimeError):
+    """All fallback models exhausted their 503 retries."""
+
+
 def get_key():
     p = subprocess.run(
         [
@@ -77,19 +84,33 @@ def get_key():
     return p.stdout.strip()
 
 
+CURRENT_STAGE = "protocol_generation"
+EXHAUSTED_MODELS = set()
+
+
 def run_gemini_curl(command, key, payload, **kwargs):
+    attempt = kwargs.pop("attempt", 1)
+    model = kwargs.pop("model", MODELS[0])
+    if CURRENT_STAGE in ("speaker_normalization", "name_detection") and "--max-time" in command:
+        command = list(command)
+        command[command.index("--max-time") + 1] = "15"
     if "\n" in key or "\r" in key:
         raise ValueError("Недопустимый API key")
     read_fd, write_fd = os.pipe()
     try:
         with os.fdopen(write_fd, "wb") as header:
             header.write(f"x-goog-api-key: {key}\n".encode("utf-8"))
-        return subprocess.run(
+        request_started(CURRENT_STAGE, model, attempt,
+                        2 if CURRENT_STAGE != "protocol_generation" and model == MODELS[0] else
+                        1 if CURRENT_STAGE != "protocol_generation" else None)
+        result = subprocess.run(
             command + ["-H", f"@/dev/fd/{read_fd}", "--data-binary", "@-"],
             input=payload,
             pass_fds=(read_fd,),
             **kwargs,
         )
+        record_request(CURRENT_STAGE, model, attempt, result)
+        return result
     finally:
         os.close(read_fd)
 
@@ -357,8 +378,11 @@ def call_gemini(batch, key, batch_number, total_batches):
     }
 
     last_error = None
+    all_models_503 = True
 
     for model_number, model in enumerate(MODELS, 1):
+        if model in EXHAUSTED_MODELS:
+            continue
         api = API_TEMPLATE.format(model=model)
 
         log()
@@ -393,6 +417,8 @@ def call_gemini(batch, key, batch_number, total_batches):
                 json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
+                model=model,
+                attempt=request_number,
             )
 
             if p.returncode != 0:
@@ -414,10 +440,17 @@ def call_gemini(batch, key, batch_number, total_batches):
             if error:
                 last_error = error
                 code = error.get("code")
+                quota_kind, quota_info = classify(error)
+                if quota_kind == "daily_quota_exhausted":
+                    EXHAUSTED_MODELS.add(model)
+                    raise DailyQuotaExhausted("Gemini daily quota exhausted")
 
                 # 429 оставляем как rate-limit текущего API key.
                 # Если сервер прислал RetryInfo — используем его.
                 if code == 429:
+                    all_models_503 = False
+                    if quota_info.get("retry_after_seconds", 0) > 65:
+                        break
                     if retry_429_used:
                         if model_number < len(MODELS):
                             next_model = MODELS[model_number]
@@ -468,6 +501,7 @@ def call_gemini(batch, key, batch_number, total_batches):
                     )
 
                     retry_429_used = True
+                    request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                     time.sleep(delay)
                     request_number += 1
                     continue
@@ -485,6 +519,7 @@ def call_gemini(batch, key, batch_number, total_batches):
                             f"(503). Один повтор через {delay} сек."
                         )
 
+                        request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                         time.sleep(delay)
                         request_number += 1
                         continue
@@ -503,15 +538,9 @@ def call_gemini(batch, key, batch_number, total_batches):
 
                         break
 
-                    raise RuntimeError(
-                        "Все модели fallback вернули 503. "
-                        "Последняя ошибка:\n"
-                        + json.dumps(
-                            error,
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-                    )
+                    if all_models_503:
+                        raise GeminiOverloaded("Все модели fallback вернули 503")
+                    raise RuntimeError("Fallback исчерпан после разных ошибок Gemini")
 
                 # Если fallback-модель не существует/недоступна
                 # для этого API, покажем точную ошибку.
@@ -899,21 +928,25 @@ def consolidate_speakers(rows, key):
     }
 
     last_error = None
+    all_models_503 = True
 
-    for model_number, model in enumerate(MODELS, 1):
+    optional_models = MODELS[:2]
+    for model_number, model in enumerate(optional_models, 1):
+        if model in EXHAUSTED_MODELS:
+            continue
         api = API_TEMPLATE.format(model=model)
 
         log()
         log(
             "Нормализация спикеров: "
-            f"модель {model_number}/{len(MODELS)} "
+            f"модель {model_number}/{len(optional_models)} "
             f"{model}"
         )
 
         request_number = 1
-        retry_429_used = False
+        retry_429_used = model_number > 1
         attempts_503 = 0
-        max_503_attempts = 3
+        max_503_attempts = 2 if model_number == 1 else 1
 
         while True:
             p = run_gemini_curl(
@@ -931,6 +964,8 @@ def consolidate_speakers(rows, key):
                 json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
+                model=model,
+                attempt=request_number,
             )
 
             if p.returncode != 0:
@@ -952,11 +987,18 @@ def consolidate_speakers(rows, key):
             if error:
                 last_error = error
                 code = error.get("code")
+                quota_kind, quota_info = classify(error)
+                if quota_kind == "daily_quota_exhausted":
+                    EXHAUSTED_MODELS.add(model)
+                    raise DailyQuotaExhausted("Gemini daily quota exhausted")
 
                 if code == 429:
+                    all_models_503 = False
+                    if quota_kind == "rate_limit_unknown" or quota_info.get("retry_after_seconds", 0) > 15:
+                        break
                     if retry_429_used:
-                        if model_number < len(MODELS):
-                            next_model = MODELS[model_number]
+                        if model_number < len(optional_models):
+                            next_model = optional_models[model_number]
                             log(
                                 "Нормализация спикеров: "
                                 f"{model} повторно вернула 429; "
@@ -990,7 +1032,7 @@ def consolidate_speakers(rows, key):
                             except Exception:
                                 pass
 
-                    delay = min(delay, 65)
+                    delay = min(delay, 15)
 
                     log(
                         "Нормализация спикеров: "
@@ -998,6 +1040,7 @@ def consolidate_speakers(rows, key):
                     )
 
                     retry_429_used = True
+                    request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                     time.sleep(delay)
                     request_number += 1
                     continue
@@ -1006,27 +1049,28 @@ def consolidate_speakers(rows, key):
                     attempts_503 += 1
 
                     if attempts_503 < max_503_attempts:
-                        delay = 10 if attempts_503 == 1 else 30
+                        delay = 5
                         log(
                             "Нормализация спикеров: "
                             f"503, повтор через {delay} сек."
                         )
+                        request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                         time.sleep(delay)
                         request_number += 1
                         continue
 
-                    if model_number < len(MODELS):
-                        next_model = MODELS[model_number]
+                    if model_number < len(optional_models):
+                        next_model = optional_models[model_number]
                         log(
                             "Нормализация спикеров: "
-                            f"{model}: 503 три раза; "
+                            f"{model}: 503 после короткого retry; "
                             f"перехожу к {next_model}."
                         )
                         break
 
-                    raise RuntimeError(
-                        "Все модели вернули 503"
-                    )
+                    if all_models_503:
+                        raise GeminiOverloaded("Все модели вернули 503")
+                    raise RuntimeError("Fallback исчерпан после разных ошибок Gemini")
 
                 raise RuntimeError(
                     f"Ошибка Gemini ({model}): "
@@ -1193,21 +1237,25 @@ def detect_speakers(rows, key):
     }
 
     last_error = None
+    all_models_503 = True
 
-    for model_number, model in enumerate(MODELS, 1):
+    optional_models = MODELS[:2]
+    for model_number, model in enumerate(optional_models, 1):
+        if model in EXHAUSTED_MODELS:
+            continue
         api = API_TEMPLATE.format(model=model)
 
         log()
         log(
             "Определение имён: "
-            f"модель {model_number}/{len(MODELS)} "
+            f"модель {model_number}/{len(optional_models)} "
             f"{model}"
         )
 
         request_number = 1
-        retry_429_used = False
+        retry_429_used = model_number > 1
         attempts_503 = 0
-        max_503_attempts = 3
+        max_503_attempts = 2 if model_number == 1 else 1
 
         while True:
             p = run_gemini_curl(
@@ -1225,6 +1273,8 @@ def detect_speakers(rows, key):
                 json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
+                model=model,
+                attempt=request_number,
             )
 
             if p.returncode != 0:
@@ -1246,11 +1296,18 @@ def detect_speakers(rows, key):
             if error:
                 last_error = error
                 code = error.get("code")
+                quota_kind, quota_info = classify(error)
+                if quota_kind == "daily_quota_exhausted":
+                    EXHAUSTED_MODELS.add(model)
+                    raise DailyQuotaExhausted("Gemini daily quota exhausted")
 
                 if code == 429:
+                    all_models_503 = False
+                    if quota_kind == "rate_limit_unknown" or quota_info.get("retry_after_seconds", 0) > 15:
+                        break
                     if retry_429_used:
-                        if model_number < len(MODELS):
-                            next_model = MODELS[model_number]
+                        if model_number < len(optional_models):
+                            next_model = optional_models[model_number]
                             log(
                                 "Определение имён: "
                                 f"{model} повторно вернула 429; "
@@ -1286,7 +1343,7 @@ def detect_speakers(rows, key):
                             except Exception:
                                 pass
 
-                    delay = min(delay, 65)
+                    delay = min(delay, 15)
 
                     log(
                         "Определение имён: "
@@ -1294,6 +1351,7 @@ def detect_speakers(rows, key):
                     )
 
                     retry_429_used = True
+                    request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                     time.sleep(delay)
                     request_number += 1
                     continue
@@ -1302,28 +1360,29 @@ def detect_speakers(rows, key):
                     attempts_503 += 1
 
                     if attempts_503 < max_503_attempts:
-                        delay = 10 if attempts_503 == 1 else 30
+                        delay = 5
                         log(
                             "Определение имён: "
                             f"503, повтор через {delay} сек."
                         )
 
+                        request_retry(CURRENT_STAGE, model, request_number + 1, delay, quota_kind)
                         time.sleep(delay)
                         request_number += 1
                         continue
 
-                    if model_number < len(MODELS):
-                        next_model = MODELS[model_number]
+                    if model_number < len(optional_models):
+                        next_model = optional_models[model_number]
                         log(
                             "Определение имён: "
-                            f"{model}: 503 три раза; "
+                            f"{model}: 503 после короткого retry; "
                             f"перехожу к {next_model}."
                         )
                         break
 
-                    raise RuntimeError(
-                        "Все модели вернули 503"
-                    )
+                    if all_models_503:
+                        raise GeminiOverloaded("Все модели вернули 503")
+                    raise RuntimeError("Fallback исчерпан после разных ошибок Gemini")
 
                 raise RuntimeError(
                     f"Ошибка Gemini ({model}): "
@@ -2312,6 +2371,7 @@ def prepare_output_dir(transcript_path, output_dir):
 
 
 def main():
+    global CURRENT_STAGE
     args = parse_args(sys.argv[1:])
     transcript_path = Path(args.transcript).expanduser().resolve()
 
@@ -2348,6 +2408,8 @@ def main():
     speaker_groups = []
     speaker_normalization_model = None
 
+    CURRENT_STAGE = "speaker_normalization"
+    progress_stage(CURRENT_STAGE, "started", "normalizing_speakers")
     try:
         normalized_rows, speaker_groups, speaker_normalization_model = (
             consolidate_speakers(
@@ -2378,8 +2440,11 @@ def main():
                 "  Надёжных объединений технических "
                 "спикеров не найдено."
             )
+        progress_stage(CURRENT_STAGE, "succeeded")
 
     except Exception as e:
+        progress_stage(CURRENT_STAGE, "warning", "optional_skipped",
+                       "Этап пропущен. Создание протокола продолжено.")
         log()
         log(
             "ПРЕДУПРЕЖДЕНИЕ: "
@@ -2396,6 +2461,8 @@ def main():
 
     # Определяем реальные имена уже ПОСЛЕ глобальной
     # нормализации speaker ID.
+    CURRENT_STAGE = "name_detection"
+    progress_stage(CURRENT_STAGE, "started", "detecting_names")
     try:
         speaker_mapping, speaker_model = detect_speakers(
             rows,
@@ -2424,8 +2491,11 @@ def main():
                     + speaker_info["speaker"]
                     + " -> неизвестно"
                 )
+        progress_stage(CURRENT_STAGE, "succeeded")
 
     except Exception as e:
+        progress_stage(CURRENT_STAGE, "warning", "optional_skipped",
+                       "Этап пропущен. Создание протокола продолжено.")
         log()
         log(
             "ПРЕДУПРЕЖДЕНИЕ: "
@@ -2455,11 +2525,16 @@ def main():
 
     all_items = []
     used_models = set()
+    CURRENT_STAGE = "protocol_generation"
+    progress_stage(CURRENT_STAGE, "started", "generating_protocol")
 
     for number, batch in enumerate(
         batches,
         1,
     ):
+        progress_stage(CURRENT_STAGE, "progress", "protocol_batch",
+                       safe_message=f"Батч {number} из {len(batches)}",
+                       batch=number, batches=len(batches))
         batch_ids = {
             row["id"]
             for row in batch
@@ -2603,9 +2678,15 @@ def main():
     log("=" * 60)
 
 
-if __name__ == "__main__":
+def cli_main():
     try:
         main()
+    except DailyQuotaExhausted:
+        print("ОШИБКА ПРОТОКОЛА: дневная квота Gemini исчерпана", file=sys.stderr)
+        return 76
+    except GeminiOverloaded:
+        print("ОШИБКА ПРОТОКОЛА: Gemini временно перегружен (503)", file=sys.stderr)
+        return 75
     except Exception as e:
         print()
         print(
@@ -2613,4 +2694,9 @@ if __name__ == "__main__":
             e,
             file=sys.stderr,
         )
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli_main())

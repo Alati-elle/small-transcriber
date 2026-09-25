@@ -12,10 +12,15 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var elapsedLabel: NSTextField!
     var fileLabel: NSTextField!
     var spinner: NSProgressIndicator!
+    var stageLabels = [NSTextField]()
+    var stageDetails = [NSTextField]()
+    var usageStack: NSStackView!
+    var renderedUsage = ""
 
     var openProtocolButton: NSButton!
     var openFolderButton: NSButton!
     var openLogButton: NSButton!
+    var retryButton: NSButton!
     var closeButton: NSButton!
 
     var startDate = Date()
@@ -26,8 +31,8 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var stdoutFinished = false
     var stderrFinished = false
     var didFinish = false
-    let stdoutLines = JSONLineBuffer()
-    let events = ManagedPipelineEvents()
+    var stdoutLines = JSONLineBuffer()
+    var events = ManagedPipelineEvents()
     var finalResult: ManagedPipelineResult?
 
     let fm = FileManager.default
@@ -92,8 +97,8 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: 560,
-                height: 330
+                width: 780,
+                height: 390
             ),
             styleMask: [
                 .titled,
@@ -123,17 +128,17 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fileLabel.translatesAutoresizingMaskIntoConstraints = false
 
         phaseLabel = NSTextField(
-            labelWithString: "Подготовка…"
+            labelWithString: "Этапы"
         )
         phaseLabel.font = NSFont.systemFont(
-            ofSize: 22,
+            ofSize: 17,
             weight: .semibold
         )
         phaseLabel.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel = NSTextField(
             wrappingLabelWithString:
-            "Подготавливаю обработку…"
+            "Подготовка…"
         )
         statusLabel.font = NSFont.systemFont(ofSize: 14)
         statusLabel.maximumNumberOfLines = 3
@@ -159,10 +164,17 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
 
         openFolderButton = NSButton(
-            title: "Открыть папку",
+            title: "Показать в Finder",
             target: self,
             action: #selector(openFolder)
         )
+
+        retryButton = NSButton(
+            title: "Повторить протокол",
+            target: self,
+            action: #selector(retryAnalysis)
+        )
+        retryButton.controlSize = .small
 
         openLogButton = NSButton(
             title: "Открыть лог",
@@ -180,6 +192,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             openProtocolButton!,
             openFolderButton!,
             openLogButton!,
+            retryButton!,
             closeButton!
         ] {
             button.translatesAutoresizingMaskIntoConstraints = false
@@ -200,38 +213,86 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buttons.alignment = .centerY
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
+        let stageStack = NSStackView()
+        stageStack.orientation = .vertical
+        stageStack.alignment = .leading
+        stageStack.spacing = 8
+        stageStack.translatesAutoresizingMaskIntoConstraints = false
+        for index in ManagedPipelineEvents.stages.indices {
+            let label = NSTextField(labelWithString: events.stageLine(index))
+            label.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+            let detail = NSTextField(wrappingLabelWithString: "")
+            detail.font = NSFont.systemFont(ofSize: 12)
+            detail.textColor = .secondaryLabelColor
+            detail.isHidden = true
+            stageLabels.append(label)
+            stageDetails.append(detail)
+            let row = NSStackView(views: index == 3 ? [label, retryButton] : [label])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.translatesAutoresizingMaskIntoConstraints = false
+            let group = NSStackView(views: [row, detail])
+            group.orientation = .vertical
+            group.alignment = .leading
+            group.spacing = 2
+            group.translatesAutoresizingMaskIntoConstraints = false
+            stageStack.addArrangedSubview(group)
+            group.widthAnchor.constraint(equalTo: stageStack.widthAnchor).isActive = true
+            row.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            detail.widthAnchor.constraint(equalTo: group.widthAnchor, constant: -20).isActive = true
+            if index == 3 {
+                retryButton.setContentHuggingPriority(.required, for: .horizontal)
+            }
+        }
+
+        let usageCard = NSView()
+        usageCard.wantsLayer = true
+        usageCard.layer?.cornerRadius = 10
+        usageCard.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        usageCard.layer?.borderColor = NSColor.separatorColor.cgColor
+        usageCard.layer?.borderWidth = 1
+        usageCard.translatesAutoresizingMaskIntoConstraints = false
+        usageStack = NSStackView()
+        usageStack.orientation = .vertical
+        usageStack.alignment = .leading
+        usageStack.spacing = 8
+        usageStack.translatesAutoresizingMaskIntoConstraints = false
+        usageCard.addSubview(usageStack)
+
         content.addSubview(fileLabel)
         content.addSubview(phaseLabel)
         content.addSubview(statusLabel)
         content.addSubview(elapsedLabel)
         content.addSubview(spinner)
         content.addSubview(buttons)
+        content.addSubview(stageStack)
+        content.addSubview(usageCard)
 
         NSLayoutConstraint.activate([
 
             fileLabel.topAnchor.constraint(
                 equalTo: content.topAnchor,
-                constant: 28
+                constant: 22
             ),
 
             fileLabel.leadingAnchor.constraint(
                 equalTo: content.leadingAnchor,
-                constant: 30
+                constant: 24
             ),
 
             fileLabel.trailingAnchor.constraint(
                 equalTo: content.trailingAnchor,
-                constant: -30
+                constant: -24
             ),
 
             spinner.leadingAnchor.constraint(
                 equalTo: content.leadingAnchor,
-                constant: 30
+                constant: 24
             ),
 
             spinner.topAnchor.constraint(
                 equalTo: fileLabel.bottomAnchor,
-                constant: 30
+                constant: 15
             ),
 
             phaseLabel.leadingAnchor.constraint(
@@ -245,44 +306,60 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             phaseLabel.trailingAnchor.constraint(
                 lessThanOrEqualTo: content.trailingAnchor,
-                constant: -30
+                constant: -24
             ),
 
-            statusLabel.topAnchor.constraint(
+            stageStack.topAnchor.constraint(
                 equalTo: phaseLabel.bottomAnchor,
-                constant: 24
+                constant: 13
+            ),
+            stageStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            stageStack.trailingAnchor.constraint(equalTo: usageCard.leadingAnchor, constant: -18),
+
+            statusLabel.topAnchor.constraint(
+                equalTo: stageStack.bottomAnchor,
+                constant: 11
             ),
 
             statusLabel.leadingAnchor.constraint(
                 equalTo: content.leadingAnchor,
-                constant: 30
+                constant: 24
             ),
 
-            statusLabel.trailingAnchor.constraint(
-                equalTo: content.trailingAnchor,
-                constant: -30
-            ),
+            statusLabel.trailingAnchor.constraint(equalTo: stageStack.trailingAnchor),
+
+            usageCard.topAnchor.constraint(equalTo: phaseLabel.topAnchor),
+            usageCard.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            usageCard.widthAnchor.constraint(equalToConstant: 265),
+            usageCard.bottomAnchor.constraint(lessThanOrEqualTo: elapsedLabel.topAnchor, constant: -14),
+            usageStack.topAnchor.constraint(equalTo: usageCard.topAnchor, constant: 14),
+            usageStack.bottomAnchor.constraint(equalTo: usageCard.bottomAnchor, constant: -14),
+            usageStack.leadingAnchor.constraint(equalTo: usageCard.leadingAnchor, constant: 14),
+            usageStack.trailingAnchor.constraint(equalTo: usageCard.trailingAnchor, constant: -14),
 
             elapsedLabel.leadingAnchor.constraint(
                 equalTo: content.leadingAnchor,
-                constant: 30
+                constant: 24
             ),
+            elapsedLabel.topAnchor.constraint(greaterThanOrEqualTo: statusLabel.bottomAnchor, constant: 14),
 
             elapsedLabel.bottomAnchor.constraint(
                 equalTo: buttons.topAnchor,
-                constant: -22
+                constant: -5
             ),
 
             buttons.trailingAnchor.constraint(
                 equalTo: content.trailingAnchor,
-                constant: -30
+                constant: -24
             ),
 
             buttons.bottomAnchor.constraint(
                 equalTo: content.bottomAnchor,
-                constant: -25
+                constant: -18
             )
         ])
+
+        renderUsage()
 
         window.makeKeyAndOrderFront(nil)
 
@@ -293,6 +370,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 
     func updateElapsed() {
+        renderStages()
 
         let seconds = Int(
             Date().timeIntervalSince(startDate)
@@ -319,10 +397,38 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
 
-    func startPipeline() {
+    func startPipeline(retry: (meetingID: String, transcriptionRunID: String)? = nil) {
+        guard currentProcess == nil else { return }
+        if retry != nil {
+            events = ManagedPipelineEvents()
+            stdoutLines = JSONLineBuffer()
+            processExitCode = nil
+            stdoutFinished = false
+            stderrFinished = false
+            didFinish = false
+            finalResult = nil
+            retryButton.isEnabled = false
+            retryButton.isHidden = true
+            openFolderButton.isHidden = true
+            openLogButton.isHidden = true
+            closeButton.isHidden = true
+            spinner.isHidden = false
+            spinner.startAnimation(nil)
+            phaseLabel.stringValue = "Создание протокола"
+            statusLabel.stringValue = "Повторяю создание протокола…"
+            startDate = Date()
+            elapsedTimer?.invalidate()
+            elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) {
+                [weak self] _ in self?.updateElapsed()
+            }
+        }
+        renderStages()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        var arguments = [pipelineScript, "run", inputPath]
+        var arguments = retry.map {
+            [pipelineScript, "retry-analysis", "--meeting-id", $0.meetingID,
+             "--transcription-run-id", $0.transcriptionRunID]
+        } ?? [pipelineScript, "run", inputPath]
         #if DEBUG
         if let root = ProcessInfo.processInfo.environment["SMALL_TRANSCRIBER_STORAGE_ROOT"],
            !root.isEmpty {
@@ -395,14 +501,20 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applyEvent(_ line: String) {
         switch events.consume(line) {
         case .started:
-            statusLabel.stringValue = "Подготавливаю обработку…"
+            if events.operation == "analysis_retry" {
+                phaseLabel.stringValue = "Создание протокола"
+                statusLabel.stringValue = "Подготавливаю повторный анализ…"
+            } else {
+                statusLabel.stringValue = "Подготавливаю обработку…"
+            }
         case .transcriptionStarted:
             phaseLabel.stringValue = "Этап 1 из 2 — Расшифровка"
             statusLabel.stringValue = "Подготавливаю аудио…"
         case .transcriptionSucceeded:
             statusLabel.stringValue = "Расшифровка создана."
         case .analysisStarted:
-            phaseLabel.stringValue = "Этап 2 из 2 — Создание протокола"
+            phaseLabel.stringValue = events.operation == "analysis_retry"
+                ? "Создание протокола" : "Этап 2 из 2 — Создание протокола"
             statusLabel.stringValue = "Подготавливаю протокол…"
         case .analysisSucceeded:
             statusLabel.stringValue = "Протокол создан."
@@ -410,8 +522,83 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             statusLabel.stringValue = message
         case .successReceived, .ignored:
             break
+        case .stateChanged:
+            break
         case .malformed:
             fputs("Ignored malformed pipeline event\n", stderr)
+        }
+        renderStages()
+    }
+
+    func renderStages() {
+        guard !stageLabels.isEmpty else { return }
+        phaseLabel.stringValue = "Этапы"
+        for index in ManagedPipelineEvents.stages.indices {
+            let key = ManagedPipelineEvents.stages[index]
+            stageLabels[index].stringValue = events.stageLine(index)
+            let state = events.stageStates[key] ?? "pending"
+            stageLabels[index].textColor = state == "running" ? .controlAccentColor : .labelColor
+            let daily = state == "failed" && key == "protocol_generation" &&
+                events.errorCode == "daily_quota_exhausted"
+            stageDetails[index].isHidden = state != "running" && !daily
+            stageDetails[index].stringValue = daily
+                ? "Дневной лимит Gemini для этой модели исчерпан."
+                : state == "running" ? events.displayLiveMessage : ""
+        }
+        renderUsage()
+    }
+
+    func renderUsage() {
+        let snapshot = events.usageText
+        guard snapshot != renderedUsage else { return }
+        renderedUsage = snapshot
+        for view in usageStack.arrangedSubviews {
+            usageStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let title = NSTextField(labelWithString: "Gemini сегодня")
+        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        usageStack.addArrangedSubview(title)
+        for (index, entry) in events.usageRows.enumerated() {
+            if entry.0 == "Загрузки" {
+                let gap = NSView()
+                usageStack.addArrangedSubview(gap)
+                gap.heightAnchor.constraint(equalToConstant: 4).isActive = true
+            }
+            if index == events.usageRows.count - 1 {
+                let rule = NSView()
+                rule.wantsLayer = true
+                rule.layer?.backgroundColor = NSColor.separatorColor.cgColor
+                usageStack.addArrangedSubview(rule)
+                rule.widthAnchor.constraint(equalTo: usageStack.widthAnchor).isActive = true
+                rule.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            }
+            let name = NSTextField(labelWithString: entry.0)
+            let weight: NSFont.Weight = index == events.usageRows.count - 1 ? .semibold : .regular
+            name.font = NSFont.systemFont(ofSize: 12, weight: weight)
+            let value: NSView
+            if entry.1.hasSuffix(" / ?") {
+                let amount = NSTextField(labelWithString: String(entry.1.dropLast()).trimmingCharacters(in: .whitespaces))
+                let unknown = NSTextField(labelWithString: "?")
+                amount.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: weight)
+                unknown.font = amount.font
+                unknown.toolTip = "Официальный лимит для этой модели пока не известен приложению."
+                let pair = NSStackView(views: [amount, unknown])
+                pair.orientation = .horizontal
+                pair.spacing = 3
+                value = pair
+            } else {
+                let known = NSTextField(labelWithString: entry.1)
+                known.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: weight)
+                value = known
+            }
+            value.setContentHuggingPriority(.required, for: .horizontal)
+            let spacer = NSView()
+            let row = NSStackView(views: [name, spacer, value])
+            row.orientation = .horizontal
+            row.spacing = 4
+            usageStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: usageStack.widthAnchor).isActive = true
         }
     }
 
@@ -441,6 +628,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         statusLabel.stringValue =
             "Расшифровка и протокол успешно созданы."
+        renderStages()
 
         openProtocolButton.isHidden = false
         openFolderButton.isHidden = false
@@ -471,15 +659,16 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         spinner.stopAnimation(nil)
         spinner.isHidden = true
 
-        phaseLabel.stringValue = "Не удалось завершить"
+        phaseLabel.stringValue = events.errorCode == "gemini_overloaded"
+            ? "Gemini временно перегружен" : "Не удалось завершить"
 
         statusLabel.stringValue = message
+        renderStages()
 
         openProtocolButton.isHidden = true
-        var isDirectory: ObjCBool = false
-        openFolderButton.isHidden = !(events.meetingDir.map {
-            fm.fileExists(atPath: $0, isDirectory: &isDirectory) && isDirectory.boolValue
-        } ?? false)
+        openFolderButton.isHidden = !isRevealable(events.transcriptPath)
+        retryButton.isHidden = !events.canRetryAnalysis
+        retryButton.isEnabled = events.canRetryAnalysis
         closeButton.isHidden = false
 
         openLogButton.isHidden =
@@ -510,11 +699,25 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 
     @objc func openFolder() {
-        guard let path = finalResult?.meetingDir ?? events.meetingDir else { return }
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: path, isDirectory: &isDirectory),
-              isDirectory.boolValue else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let path = finalResult?.activeHTMLPath ?? events.transcriptPath
+        guard isRevealable(path), let path = path else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    func isRevealable(_ path: String?) -> Bool {
+        guard let path = path,
+              let attributes = try? fm.attributesOfItem(atPath: path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber else { return false }
+        return size.intValue > 0
+    }
+
+    @objc func retryAnalysis() {
+        guard currentProcess == nil, events.canRetryAnalysis,
+              let meetingID = events.meetingID,
+              let transcriptionRunID = events.transcriptionRunID else { return }
+        retryButton.isEnabled = false
+        startPipeline(retry: (meetingID, transcriptionRunID))
     }
 
 

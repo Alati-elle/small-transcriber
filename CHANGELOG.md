@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Managed source: пять видимых этапов GUI с live progress, локальный счётчик Gemini по моделям, отдельный upload count и условный показ подтверждённого дневного лимита.
+- SQLite schema v2 добавляет `gemini_request_usage` и `gemini_quota_observations` с миграцией v1 без пересоздания встреч или runs; сутки считаются по `America/Los_Angeles`.
+- Structured Gemini request events и классификация 429 по metadata; подтверждённая дневная квота прекращает retry, optional speaker/name stages ограничены короткой политикой, а основной protocol failure остаётся критическим.
+- Добавлен `retry-analysis` для нового protocol analysis run из проверенной успешной расшифровки без повторной транскрипции; failed runs сохраняются, active переключается только после успешной публикации.
+- Исчерпание 503 по всем fallback-моделям получает стабильный `gemini_overloaded` и понятное сообщение в DEV GUI; сырой ответ Gemini не показывается.
+- GUI предлагает повторить только создание протокола и показывает опубликованный HTML или TXT через Finder reveal вместо навигации по UUID-каталогам. Production app не изменён.
 - Source Swift GUI подключён к одному managed orchestrator process и его JSON Lines progress; итоговые пути берутся из события. Изменение ещё не установлено в production.
 - Добавлен source managed meeting pipeline orchestrator: SQLite lifecycle, изолированные run directories, проверка и публикация transcript/JSON/HTML, JSON Lines progress. К production Swift GUI ещё не подключён.
 - В protocol generator добавлен explicit managed-output mode с caller-provided пустым staging-каталогом и проверкой пары JSON/HTML перед публикацией. Legacy behavior сохранён; к production GUI режим пока не подключён.

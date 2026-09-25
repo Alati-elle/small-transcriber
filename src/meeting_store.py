@@ -4,15 +4,60 @@ import hashlib
 import os
 import sqlite3
 import stat
+import subprocess
 import uuid
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # macOS development Python 3.8
+    ZoneInfo = None
 
 
 DEFAULT_ROOT = Path.home() / "Library/Application Support/Small Transcriber"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+USAGE_SCHEMA = """
+CREATE TABLE gemini_request_usage (
+    id INTEGER PRIMARY KEY,
+    timestamp_utc TEXT NOT NULL,
+    quota_date_pacific TEXT NOT NULL,
+    meeting_id TEXT,
+    analysis_run_id TEXT,
+    transcription_run_id TEXT,
+    stage TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_type TEXT NOT NULL CHECK (request_type IN ('generate_content', 'upload', 'other')),
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
+    outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'http_429', 'http_503', 'other_error')),
+    http_status INTEGER,
+    quota_kind TEXT
+);
+CREATE INDEX idx_gemini_usage_day ON gemini_request_usage(quota_date_pacific, request_type, model);
+CREATE TABLE gemini_quota_observations (
+    id INTEGER PRIMARY KEY,
+    timestamp_utc TEXT NOT NULL,
+    quota_date_pacific TEXT NOT NULL,
+    model TEXT NOT NULL,
+    quota_kind TEXT NOT NULL,
+    quota_value REAL,
+    retry_after_seconds REAL,
+    quota_metric_safe TEXT,
+    quota_id_safe TEXT
+);
+"""
+
+
+def quota_date_pacific(at=None):
+    instant = at or datetime.now(timezone.utc)
+    if ZoneInfo is not None:
+        return instant.astimezone(ZoneInfo('America/Los_Angeles')).date().isoformat()
+    result = subprocess.run(['/bin/date', '-r', str(int(instant.timestamp())), '+%Y-%m-%d'],
+                            env={**os.environ, 'TZ': 'America/Los_Angeles'},
+                            capture_output=True, text=True, check=True)
+    return result.stdout.strip()
 
 SCHEMA = """
 CREATE TABLE meetings (
@@ -129,12 +174,7 @@ class MeetingStore:
         self.db_path = self.root / "index.sqlite3"
 
     def initialize(self):
-        """Create or reopen the private v1 DB; return None.
-
-        Raise ValueError for a symlink root, PermissionError unless root/DB
-        have modes 0700/0600, or RuntimeError for an unknown schema version
-        or missing v1 tables. Existing columns are not exhaustively checked.
-        """
+        """Create or reopen the private v2 DB; migrate v1 in place."""
         if self.root.is_symlink():
             raise ValueError("Managed root cannot be a symlink")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -153,21 +193,69 @@ class MeetingStore:
 
         with closing(self._connect()) as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == SCHEMA_VERSION:
-                tables = {row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )}
-                if not {"meetings", "transcription_runs", "analysis_runs"} <= tables:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            required = {"meetings", "transcription_runs", "analysis_runs"}
+            if version in (1, SCHEMA_VERSION):
+                if not required <= tables:
                     raise RuntimeError("Incomplete schema v1")
+                if version == SCHEMA_VERSION:
+                    if not {"gemini_request_usage", "gemini_quota_observations"} <= tables:
+                        raise RuntimeError("Incomplete schema v2")
+                    return
+                conn.executescript("BEGIN IMMEDIATE;\n" + USAGE_SCHEMA +
+                                   "PRAGMA user_version = 2;\nCOMMIT;")
                 return
             if version != 0 or conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
             ).fetchone():
                 raise RuntimeError("Unknown database schema")
             conn.executescript(
-                "BEGIN IMMEDIATE;\n" + SCHEMA +
-                "PRAGMA user_version = 1;\nCOMMIT;"
+                "BEGIN IMMEDIATE;\n" + SCHEMA + USAGE_SCHEMA +
+                "PRAGMA user_version = 2;\nCOMMIT;"
             )
+
+    def record_gemini_request(self, *, stage, model, request_type, attempt, outcome,
+                              http_status=None, quota_kind=None, meeting_id=None,
+                              analysis_run_id=None, transcription_run_id=None, observation=None):
+        at = datetime.now(timezone.utc)
+        day = quota_date_pacific(at)
+        stamp = at.isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self._write() as conn:
+            conn.execute("INSERT INTO gemini_request_usage "
+                         "(timestamp_utc,quota_date_pacific,meeting_id,analysis_run_id,"
+                         "transcription_run_id,stage,model,request_type,attempt,outcome,http_status,quota_kind) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (stamp, day, meeting_id, analysis_run_id, transcription_run_id,
+                          stage, model, request_type, attempt, outcome, http_status, quota_kind))
+            if observation and quota_kind in ('rate_limit_rpm', 'rate_limit_tpm', 'daily_quota_exhausted'):
+                conn.execute("INSERT INTO gemini_quota_observations "
+                             "(timestamp_utc,quota_date_pacific,model,quota_kind,quota_value,"
+                             "retry_after_seconds,quota_metric_safe,quota_id_safe) VALUES (?,?,?,?,?,?,?,?)",
+                             (stamp, day, model, quota_kind, observation.get('quota_value'),
+                              observation.get('retry_after_seconds'), observation.get('quota_metric_safe'),
+                              observation.get('quota_id_safe')))
+        return self.gemini_usage_snapshot()
+
+    def gemini_usage_snapshot(self):
+        day = quota_date_pacific()
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT model, request_type, count(*) AS n FROM gemini_request_usage "
+                                "WHERE quota_date_pacific=? GROUP BY model,request_type", (day,))
+            models, upload = {}, 0
+            for row in rows:
+                if row['request_type'] == 'generate_content':
+                    models[row['model']] = row['n']
+                elif row['request_type'] == 'upload':
+                    upload += row['n']
+            limits = {}
+            for row in conn.execute("SELECT model,quota_value FROM gemini_quota_observations "
+                                    "WHERE quota_date_pacific=? AND quota_kind='daily_quota_exhausted' "
+                                    "ORDER BY id DESC", (day,)):
+                if row['model'] not in limits and row['quota_value'] is not None:
+                    limits[row['model']] = row['quota_value']
+        return {'quota_date': day, 'models': models, 'total': sum(models.values()),
+                'upload': upload, 'observed_daily_limits': limits}
 
     def _connect(self):
         # mode=rw prevents an accidental database creation outside initialize().

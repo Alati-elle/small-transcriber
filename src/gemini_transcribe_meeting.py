@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import time
+from gemini_telemetry import (DailyQuotaExhausted, classify, request as record_request,
+                              request_started, request_retry, stage as progress_stage)
 import tempfile
 import uuid
 import difflib
@@ -49,18 +51,26 @@ def run(cmd, **kwargs):
 
 
 def run_gemini_curl(command, key, payload, **kwargs):
+    request_type = kwargs.pop("request_type", "generate_content")
+    attempt = kwargs.pop("attempt", 1)
+    check = kwargs.pop("check", False)
     if "\n" in key or "\r" in key:
         raise ValueError("Недопустимый API key")
     read_fd, write_fd = os.pipe()
     try:
         with os.fdopen(write_fd, "wb") as header:
             header.write(f"x-goog-api-key: {key}\n".encode("utf-8"))
-        return subprocess.run(
+        request_started("transcription", MODEL, attempt, MAX_TRANSCRIBE_ATTEMPTS, request_type)
+        result = subprocess.run(
             command + ["-H", f"@/dev/fd/{read_fd}", "--data-binary", "@-"],
             input=payload,
             pass_fds=(read_fd,),
             **kwargs,
         )
+        record_request("transcription", MODEL, attempt, result, request_type)
+        if check:
+            result.check_returncode()
+        return result
     finally:
         os.close(read_fd)
 
@@ -220,6 +230,7 @@ def upload_audio(path, key):
         capture_output=True,
         text=True,
         check=True,
+        request_type="upload",
     ).stdout
 
     m = re.search(
@@ -232,6 +243,7 @@ def upload_audio(path, key):
 
     upload_url = m.group(1).strip()
 
+    request_started("transcription", MODEL, 1, request_type="upload")
     p = subprocess.run(
         [
             "curl", "-4", "-sS",
@@ -245,8 +257,10 @@ def upload_audio(path, key):
         ],
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    record_request("transcription", MODEL, 1, p, "upload")
+    p.check_returncode()
 
     data = json.loads(p.stdout)
 
@@ -322,6 +336,7 @@ def transcribe(uri, key, vocabulary=None):
             json.dumps(payload),
             capture_output=True,
             text=True,
+            attempt=attempt,
         )
 
         try:
@@ -342,55 +357,9 @@ def transcribe(uri, key, vocabulary=None):
                 json.dumps(error, ensure_ascii=False, indent=2)
             )
 
-        # Разбираем причину 429.
-        # Если исчерпана дневная квота, повторять запрос сейчас
-        # бессмысленно — сразу останавливаемся.
-        quota_messages = []
-        daily_quota = False
-
-        for detail in error.get("details", []):
-            dtype = detail.get("@type", "")
-
-            if dtype.endswith("QuotaFailure"):
-                for violation in detail.get("violations", []):
-                    quota_id = str(
-                        violation.get("quotaId")
-                        or violation.get("quotaMetric")
-                        or ""
-                    )
-                    description = str(
-                        violation.get("description")
-                        or ""
-                    )
-
-                    quota_text = " | ".join(
-                        x for x in (quota_id, description) if x
-                    )
-
-                    if quota_text:
-                        quota_messages.append(quota_text)
-
-                    lowered = quota_text.lower()
-
-                    if (
-                        "perday" in lowered
-                        or "per_day" in lowered
-                        or "daily" in lowered
-                        or "requestsperday" in lowered
-                    ):
-                        daily_quota = True
-
-        if quota_messages:
-            log("  Причина 429:")
-            for message in quota_messages:
-                log("    " + message)
-
-        if daily_quota:
-            raise RuntimeError(
-                "Gemini: исчерпана дневная квота (RPD). "
-                "Повторные запросы сейчас не выполняю. "
-                "Уже готовые chunks сохранены."
-            )
+        quota_kind, observation = classify(error)
+        if quota_kind == "daily_quota_exhausted":
+            raise DailyQuotaExhausted("Gemini daily quota exhausted")
 
         if attempt >= MAX_TRANSCRIBE_ATTEMPTS:
             raise RuntimeError(
@@ -401,17 +370,7 @@ def transcribe(uri, key, vocabulary=None):
                 "повторите запуск позднее."
             )
 
-        delay = 65
-
-        for detail in error.get("details", []):
-            if detail.get("@type", "").endswith("RetryInfo"):
-                raw = detail.get("retryDelay", "")
-                try:
-                    delay = int(float(raw.rstrip("s"))) + 5
-                except Exception:
-                    pass
-
-        delay = min(delay, 65)
+        delay = min(observation.get("retry_after_seconds", 60) + 5, 65)
 
         log(
             f"  Rate limit — жду {delay} сек. "
@@ -419,6 +378,7 @@ def transcribe(uri, key, vocabulary=None):
             f"{MAX_TRANSCRIBE_ATTEMPTS})"
         )
 
+        request_retry("transcription", MODEL, attempt + 1, delay, quota_kind)
         time.sleep(delay)
         attempt += 1
 
@@ -1728,6 +1688,7 @@ def main():
 
     log("=" * 60)
     log("GEMINI TRANSCRIBE")
+    progress_stage("transcription", "progress", "preparing_audio", "Подготовка аудио…")
     log(f"Исходник: {source}")
     log(f"Результат: {outdir}")
     log("=" * 60)
@@ -1740,6 +1701,8 @@ def main():
     chunk_parts = []
 
     for number, (audio, chunk_start) in enumerate(chunks, 1):
+        progress_stage("transcription", "progress", "transcription_chunk",
+                       f"Фрагмент {number} из {len(chunks)}", chunk=number, chunks=len(chunks))
         json_path = audio.with_name(
             audio.stem + "_gemini.json"
         )
@@ -1811,6 +1774,7 @@ def main():
 
     log()
     log("Склеиваю части...")
+    progress_stage("transcription", "progress", "merging_transcript", "Объединение расшифровки…")
 
     merged, diagnostics = merge(chunk_parts, OVERLAP)
     total_duration = duration(source)

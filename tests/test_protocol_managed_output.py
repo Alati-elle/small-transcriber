@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -110,6 +111,65 @@ class ProtocolManagedOutputTests(unittest.TestCase):
             self.run_synthetic(fail=True)
         self.assertFalse((self.output / "meeting_ПРОТОКОЛ.json").exists())
         self.assertFalse((self.output / "meeting_ПРОТОКОЛ.html").exists())
+
+    def test_all_fallback_503_has_stable_exit_without_raw_body(self):
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "error": {"code": 503, "status": "UNAVAILABLE", "message": "raw Gemini body"}
+        }), stderr="")
+        row = dict(id="u1", start="00:00", end="00:01", speaker="Спикер 0", text="Тест")
+        with mock.patch.object(self.protocol, "run_gemini_curl", return_value=response) as call, \
+                mock.patch.object(self.protocol.time, "sleep"):
+            with self.assertRaises(self.protocol.GeminiOverloaded):
+                self.protocol.call_gemini([row], "fake", 1, 1)
+        self.assertEqual(call.call_count, len(self.protocol.MODELS) * 3)
+        stderr = io.StringIO()
+        with mock.patch.object(self.protocol, "main", side_effect=self.protocol.GeminiOverloaded()), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.protocol.cli_main(), 75)
+        self.assertNotIn("raw Gemini body", stderr.getvalue())
+        self.assertIn("503", stderr.getvalue())
+
+    def test_generic_protocol_error_keeps_generic_exit(self):
+        with mock.patch.object(self.protocol, "main", side_effect=RuntimeError("synthetic")), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.protocol.cli_main(), 1)
+
+    def test_daily_quota_stops_main_protocol_without_retry(self):
+        response = SimpleNamespace(returncode=0, stdout=json.dumps({"error": {"code": 429,
+            "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                         "violations": [{"quotaId": "GenerateRequestsPerDay", "quotaValue": 20}]}]}}), stderr="")
+        row = dict(id="u1", start="00:00", end="00:01", speaker="Спикер 0", text="Тест")
+        with mock.patch.object(self.protocol, "run_gemini_curl", return_value=response) as call, \
+                mock.patch.object(self.protocol.time, "sleep") as sleep:
+            with self.assertRaises(self.protocol.DailyQuotaExhausted):
+                self.protocol.call_gemini([row], "fake", 1, 1)
+        self.assertEqual(call.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_optional_stages_use_at_most_three_503_requests(self):
+        response = SimpleNamespace(returncode=0, stdout='{"error":{"code":503}}', stderr="")
+        rows = [dict(id="u1", start="00:00", end="00:01", speaker="Спикер 0", text="Тест"),
+                dict(id="u2", start="00:01", end="00:02", speaker="Спикер 1", text="Тест")]
+        for function in (self.protocol.consolidate_speakers, self.protocol.detect_speakers):
+            with self.subTest(function=function.__name__), \
+                    mock.patch.object(self.protocol, "run_gemini_curl", return_value=response) as call, \
+                    mock.patch.object(self.protocol.time, "sleep") as sleep:
+                with self.assertRaises(self.protocol.GeminiOverloaded):
+                    function(rows, "fake")
+                self.assertEqual(call.call_count, 3)
+                self.assertEqual(sleep.call_count, 1)
+
+    def test_mixed_429_and_503_is_not_classified_as_all_503(self):
+        def response(code):
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"error": {"code": code}}),
+                                   stderr="")
+        row = dict(id="u1", start="00:00", end="00:01", speaker="Спикер 0", text="Тест")
+        with mock.patch.object(self.protocol, "run_gemini_curl",
+                               side_effect=[response(429)] + [response(503)] * 9), \
+                mock.patch.object(self.protocol.time, "sleep"):
+            with self.assertRaises(RuntimeError) as caught:
+                self.protocol.call_gemini([row], "fake", 1, 1)
+        self.assertNotIsInstance(caught.exception, self.protocol.GeminiOverloaded)
 
     def test_invalid_json_structure_prevents_publication(self):
         self.output.mkdir(parents=True)

@@ -54,14 +54,31 @@ class PipelineTests(unittest.TestCase):
         events = [json.loads(line) for line in result.stdout.splitlines()]
         return audio, result, events
 
+    def retry(self, meeting_id, protocol_script=None, transcription_run_id=None):
+        cmd = [sys.executable, str(Path(pipeline.__file__)), "retry-analysis",
+               "--meeting-id", meeting_id, "--storage-root", str(self.root),
+               "--protocol-script", str(protocol_script or self.protocol)]
+        if transcription_run_id:
+            cmd += ["--transcription-run-id", transcription_run_id]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return result, [json.loads(line) for line in result.stdout.splitlines()]
+
     def test_success_lifecycle_events_paths_and_permissions(self):
         audio, result, events = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([e["event"] for e in events], ["pipeline_started", "transcription_started",
-                         "transcription_succeeded", "analysis_started", "analysis_succeeded", "pipeline_succeeded"])
+        self.assertEqual([e["event"] for e in events if e["event"] in (
+            "pipeline_started", "transcription_started", "transcription_succeeded",
+            "analysis_started", "analysis_succeeded", "pipeline_succeeded")],
+            ["pipeline_started", "transcription_started", "transcription_succeeded",
+             "analysis_started", "analysis_succeeded", "pipeline_succeeded"])
+        self.assertEqual(events[1]["event"], "usage_updated")
+        self.assertEqual(events[1]["total"], 0)
+        self.assertTrue(all(e.get("operation") == "full" for e in (events[0], events[-1])))
+        by_event = {e["event"]: e for e in events}
+        self.assertEqual(by_event["transcription_succeeded"]["transcript_path"], events[-1]["transcript_path"])
         self.assertEqual(events[0]["meeting_dir"], events[-1]["meeting_dir"])
-        self.assertEqual(events[1]["current_log_path"], events[-1]["transcribe_log_path"])
-        self.assertEqual(events[3]["current_log_path"], events[-1]["protocol_log_path"])
+        self.assertEqual(by_event["transcription_started"]["current_log_path"], events[-1]["transcribe_log_path"])
+        self.assertEqual(by_event["analysis_started"]["current_log_path"], events[-1]["protocol_log_path"])
         self.assertNotIn("SYNTHETIC TRANSCRIPT", result.stdout)
         final = events[-1]
         meeting_id = final["meeting_id"]
@@ -87,6 +104,21 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(Path(final["active_json_path"]).stat().st_mode), 0o600)
         self.assertTrue(Path(final["meeting_dir"]).is_dir())
 
+    def test_child_progress_is_forwarded_without_raw_log(self):
+        script = self.base / "progress_transcriber.py"
+        script.write_text(TRANSCRIBER + "\n"
+            "print('@@small-transcriber-event:{\"event\":\"stage_progress\",\"stage\":\"transcription\","
+            "\"status\":\"progress\",\"message_code\":\"transcription_chunk\","
+            "\"chunk\":1,\"chunks\":1,\"safe_message\":\"PRIVATE TRANSCRIPT BODY\"}', flush=True)\n"
+            "print('PRIVATE TRANSCRIPT BODY', flush=True)\n", encoding="utf-8")
+        _, result, events = self.invoke(transcriber_script=script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        progress = next(e for e in events if e["event"] == "stage_progress")
+        self.assertEqual(progress["safe_message"], "Фрагмент 1 из 1")
+        self.assertEqual(progress["operation"], "full")
+        self.assertNotIn("PRIVATE TRANSCRIPT BODY", result.stdout)
+        self.assertIn("PRIVATE TRANSCRIPT BODY", Path(events[-1]["transcribe_log_path"]).read_text())
+
     def test_source_failure_does_not_initialize_storage(self):
         missing = self.base / "absent.m4a"
         result = subprocess.run([sys.executable, str(Path(pipeline.__file__)), "run", str(missing),
@@ -108,7 +140,7 @@ class PipelineTests(unittest.TestCase):
                 _, result, events = self.invoke(name)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events[-1]["status"], expected)
-                self.assertEqual(events[-1]["current_log_path"], events[1]["current_log_path"])
+                self.assertEqual(events[-1]["current_log_path"], next(e for e in events if e["event"] == "transcription_started")["current_log_path"])
                 store = MeetingStore(self.root)
                 meeting_id = events[-1]["meeting_id"]
                 self.assertEqual(store.list_transcription_runs(meeting_id)[0]["status"], expected)
@@ -137,7 +169,7 @@ class PipelineTests(unittest.TestCase):
                 _, result, events = self.invoke(protocol_script=script)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events[-1]["status"], expected)
-                self.assertEqual(events[-1]["current_log_path"], events[3]["current_log_path"])
+                self.assertEqual(events[-1]["current_log_path"], next(e for e in events if e["event"] == "analysis_started")["current_log_path"])
                 store = MeetingStore(self.root)
                 meeting_id = events[-1]["meeting_id"]
                 self.assertEqual(store.list_transcription_runs(meeting_id)[0]["status"], "succeeded")
@@ -236,6 +268,110 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(first["active_json_path"], second["active_json_path"])
         self.assertTrue(Path(first["transcript_path"]).is_file())
         self.assertTrue(Path(second["transcript_path"]).is_file())
+
+    def test_retry_preserves_failed_analysis_and_transcript_without_audio(self):
+        failing = self.base / "failing_protocol.py"
+        failing.write_text("import sys; sys.exit(8)\n", encoding="utf-8")
+        audio, first, events = self.invoke(protocol_script=failing)
+        self.assertNotEqual(first.returncode, 0)
+        meeting_id = events[-1]["meeting_id"]
+        store = MeetingStore(self.root)
+        old = store.list_analysis_runs(meeting_id)[0]
+        trans = store.list_transcription_runs(meeting_id)[0]
+        transcript = store.resolve_managed_path(trans["transcript_path"])
+        original = transcript.read_bytes()
+        audio.unlink()
+        result, retry_events = self.retry(meeting_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([e["event"] for e in retry_events if e["event"] in (
+            "pipeline_started", "analysis_started", "analysis_succeeded", "pipeline_succeeded")],
+            ["pipeline_started", "analysis_started", "analysis_succeeded", "pipeline_succeeded"])
+        self.assertTrue(all(e["operation"] == "analysis_retry" for e in retry_events if "operation" in e))
+        self.assertFalse(any(e["event"] == "transcription_started" for e in retry_events))
+        self.assertEqual(retry_events[0]["transcription_run_id"], trans["id"])
+        self.assertEqual(transcript.read_bytes(), original)
+        self.assertEqual(store.list_transcription_runs(meeting_id), [trans])
+        analyses = store.list_analysis_runs(meeting_id)
+        self.assertEqual(len(analyses), 2)
+        self.assertEqual(next(a for a in analyses if a["id"] == old["id"]), old)
+        new = next(a for a in analyses if a["id"] != old["id"])
+        self.assertEqual(new["status"], "succeeded")
+        self.assertEqual(store.get_active_analysis(meeting_id)["id"], new["id"])
+        self.assertTrue(Path(retry_events[-1]["active_html_path"]).is_file())
+
+    def test_failed_retry_keeps_previous_active_and_can_retry_again(self):
+        audio, first, events = self.invoke()
+        self.assertEqual(first.returncode, 0)
+        meeting_id = events[-1]["meeting_id"]
+        store = MeetingStore(self.root)
+        active_id = store.get_active_analysis(meeting_id)["id"]
+        audio.unlink()
+        failing = self.base / "failing_protocol.py"
+        failing.write_text("import sys; sys.exit(8)\n", encoding="utf-8")
+        failed, failure_events = self.retry(meeting_id, failing)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failure_events[-1]["operation"], "analysis_retry")
+        self.assertEqual(failure_events[-1]["status"], "failed")
+        self.assertEqual(store.get_active_analysis(meeting_id)["id"], active_id)
+        second, retry_events = self.retry(meeting_id)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(store.list_transcription_runs(meeting_id)), 1)
+        self.assertEqual(sorted(a["status"] for a in store.list_analysis_runs(meeting_id)),
+                         ["failed", "succeeded", "succeeded"])
+        self.assertEqual(store.get_active_analysis(meeting_id)["id"], retry_events[-1]["analysis_run_id"])
+
+    def test_retry_rejects_missing_and_changed_transcript_before_new_run(self):
+        for change in ("missing", "changed"):
+            with self.subTest(change=change):
+                audio, first, events = self.invoke(name=change + ".m4a")
+                self.assertEqual(first.returncode, 0)
+                meeting_id = events[-1]["meeting_id"]
+                store = MeetingStore(self.root)
+                trans = store.list_transcription_runs(meeting_id)[0]
+                transcript = store.resolve_managed_path(trans["transcript_path"])
+                if change == "missing": transcript.unlink()
+                else: transcript.write_text("tampered", encoding="utf-8")
+                audio.unlink()
+                failed, failure_events = self.retry(meeting_id)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual(failure_events[-1]["operation"], "analysis_retry")
+                self.assertEqual(len(store.list_analysis_runs(meeting_id)), 1)
+
+    def test_retry_requires_explicit_run_when_multiple_succeeded(self):
+        _, first, events = self.invoke()
+        self.assertEqual(first.returncode, 0)
+        meeting_id = events[-1]["meeting_id"]
+        store = MeetingStore(self.root)
+        first_run = store.list_transcription_runs(meeting_id)[0]
+        second_id = store.create_transcription_run(meeting_id)
+        store.mark_transcription_succeeded(second_id, first_run["transcript_path"],
+                                           first_run["transcript_sha256"])
+        before = len(store.list_analysis_runs(meeting_id))
+        failed, failure_events = self.retry(meeting_id)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failure_events[-1]["phase"], "storage")
+        self.assertEqual(len(store.list_analysis_runs(meeting_id)), before)
+        selected, selected_events = self.retry(meeting_id, transcription_run_id=first_run["id"])
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(selected_events[-1]["transcription_run_id"], first_run["id"])
+
+    def test_protocol_exit_75_is_structured_without_log_text_in_events(self):
+        overloaded = self.base / "overloaded_protocol.py"
+        overloaded.write_text("import sys; print('raw Gemini body', file=sys.stderr); sys.exit(75)\n",
+                              encoding="utf-8")
+        _, first, events = self.invoke(protocol_script=overloaded)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(events[-1]["error_code"], "gemini_overloaded")
+        self.assertNotIn("raw Gemini body", first.stdout)
+        second, retry_events = self.retry(events[-1]["meeting_id"], overloaded)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertEqual(retry_events[-1]["error_code"], "gemini_overloaded")
+
+    def test_retry_missing_storage_does_not_create_root(self):
+        result, events = self.retry("missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(events[-1]["operation"], "analysis_retry")
+        self.assertFalse(self.root.exists())
 
 
 if __name__ == "__main__":

@@ -10,15 +10,17 @@ Root по умолчанию: `~/Library/Application Support/Small Transcriber/`
 
 `initialize()` требует режим `0700` для root и `0600` для DB. Orchestrator создаёт каталоги run с приватным umask `077`; stage logs имеют режим `0600`.
 
-## Data model и SQLite schema v1
+## Data model и SQLite schema v2
 
-SQLite `user_version = 1`, три таблицы:
+SQLite `user_version = 2`. Исходные три таблицы встреч и runs сохранены; миграция v1 → v2 добавляет две таблицы без пересоздания существующих строк:
 
 | Таблица | Смысл и важные поля |
 |---|---|
 | `meetings` | Устойчивая идентичность встречи (`id` — UUIDv4), время создания, название, вид и метаданные источника, `active_analysis_run_id`. Идентичность не определяется именем файла. |
 | `transcription_runs` | Отдельные попытки транскрипции одной встречи: статус, backend/model, параметры, hash источника, относительный путь и hash TXT. Успешный run требует путь и SHA-256 расшифровки. |
 | `analysis_runs` | Отдельные версии анализа успешной транскрипции: статус, параметры модели, hash входного TXT, относительные пути JSON/HTML и их hashes. Успешный run требует метаданные обоих outputs. |
+| `gemini_request_usage` | Локальные фактически отправленные API attempts, раздельно по model, stage и request type. |
+| `gemini_quota_observations` | Только подтверждённые безопасные quota metadata из ответов Gemini. |
 
 Все ID — строки UUIDv4; для связей включён `PRAGMA foreign_keys = ON` на каждом соединении. `transcription_runs.meeting_id` ссылается на встречу. Составной FK `(analysis_runs.meeting_id, transcription_run_id)` требует транскрипцию той же встречи. Составной FK `(meetings.id, active_analysis_run_id)` ссылается на `(analysis_runs.meeting_id, id)` и не допускает active run чужой встречи. Для этого в таблицах runs есть `UNIQUE(meeting_id, id)`. Статусы ограничены `running`, `succeeded`, `failed`, `interrupted`, `cancelled`, `incomplete`.
 
@@ -89,13 +91,23 @@ meetings/<meeting-id>/
 
 stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные IDs/phase/status); `pipeline_started` передаёт `meeting_dir`, stage events и `pipeline_failed` — `current_log_path`, финальный `pipeline_succeeded` содержит пути к опубликованным outputs и логам. Ошибки дают `pipeline_failed` и ненулевой exit. Transcript, prompt и API key в события не включаются. Source Swift GUI использует эти events и не читает/не пишет SQLite; «Открыть протокол» использует `active_html_path`, «Открыть папку» — `meeting_dir` как контейнер всей встречи.
 
-Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Установленный GUI и installer пока не подключены к orchestrator. Source GUI не ищет прежний legacy protocol рядом с source при ошибке; previous active UX отложен до re-analysis/history.
+Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Production GUI и installer пока не подключены к orchestrator; отдельный DEV app использует managed flow. Source GUI не ищет прежний legacy protocol рядом с source при ошибке; history UI отложен.
+
+`retry-analysis --meeting-id UUID [--transcription-run-id UUID]` использует уже опубликованный TXT успешной транскрипции. При единственном successful transcription run он выбирается автоматически; при нескольких требуется явный ID. До нового analysis run проверяются managed path, наличие TXT и SHA-256 из SQLite. Source audio и transcriber не вызываются. Новый run получает собственные `protocol.log`, `.staging/` и `published/`; старые failed logs/staging и предыдущий active run остаются. Только проверенная пара JSON/HTML и успешный read-back позволяют переключить active analysis. Ошибка протокола оставляет новый run failed/incomplete и не меняет active pointer. События retry содержат `operation: "analysis_retry"` и не содержат `transcription_started`.
+
+Protocol generator завершает процесс кодом `75`, когда все fallback-модели исчерпали 503. Orchestrator передаёт `error_code: "gemini_overloaded"` в `pipeline_failed`; содержимое ответа Gemini остаётся в приватном run log и не передаётся GUI. Другие ошибки сохраняют общий контракт failure.
+
+`gemini_request_usage` хранит по одной строке на фактический API attempt с HTTP response evidence: UTC timestamp, дату квотных суток `America/Los_Angeles`, IDs встречи/runs, stage, model, `request_type` (`generate_content`, `upload`, `other`), attempt, outcome (`succeeded`, `http_429`, `http_503`, `other_error`), HTTP status и безопасный quota kind. Локальный DNS/connect failure без ответа, сон, решение повторить, ffmpeg и cache hit строку не создают. Upload File API учитывается отдельно от generate-content. `gemini_quota_observations` хранит только безопасные quota ID/metric, числовой лимит и retry delay, когда Gemini реально их вернул. Prompt, transcript, ключ, Authorization и raw body в эти таблицы не пишутся.
+
+«Gemini сегодня» — локальный счётчик приложения за текущие сутки квоты Google в `America/Los_Angeles`, а не локальные календарные сутки пользователя и не официальный остаток квоты. Подтверждённый API лимит показывается отдельно только после наблюдения `quotaValue` для дневной квоты. Существующие более ранние запросы до установки этого счётчика в локальную статистику не входят.
+
+Дочерние managed scripts передают структурированные `stage_*`, `gemini_request_*` и `usage_updated` через приватный stdout префикс. Orchestrator переводит их в JSON Lines для Swift и не пересылает raw child log. `usage_updated` выдаётся также в начале full run и analysis retry до первого нового API request. `stage` принимает `transcription`, `speaker_normalization`, `name_detection`, `protocol_generation`, `finalization`; finalization охватывает validation, публикацию, запись SQLite и active read-back. Optional stages дают warning и позволяют протоколу продолжаться; failure протокола остаётся критическим.
 
 ## What is not implemented yet
 
 - Production Swift GUI не подключён к source orchestrator; текущий установленный flow не меняется.
 - Реальная пользовательская DB пока не создаётся.
-- Recovery running runs, повторный analysis существующей встречи, legacy importer и history UI пока отсутствуют.
+- Recovery running runs, legacy importer и history UI пока отсутствуют; повторный analysis доступен через CLI и кнопку после ошибки в текущем окне.
 - Speaker overrides и user task state отсутствуют.
 
 ## Phase 1 roadmap
