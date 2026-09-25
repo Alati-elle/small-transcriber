@@ -43,6 +43,20 @@ SQLite `user_version = 1`, три таблицы:
 
 Проверка пути действительна в момент разрешения. При будущем чтении и записи integration layer должен повторно проверять путь и учитывать замену symlink между проверкой и открытием файла. `source_original_path` — метаданные внешнего источника, а не managed artifact path.
 
+## Phase 1B: managed transcriber
+
+Первый отдельный building block реализован в source-версии transcriber:
+
+```text
+python3 src/gemini_transcribe_meeting.py AUDIO --output-dir DIR --cache-dir DIR --expected-source-sha256 HEX
+```
+
+Все три опции обязательны вместе; `--output-dir` включает managed mode. Вызывающий слой задаёт оба каталога: final TXT и `_service/merge_diagnostics.json` находятся в output-dir, chunks и cache — в cache-dir. Каталоги могут уже существовать, совпадать или быть вложенными друг в друга. Существующие symlink-пути отдельных артефактов отклоняются; принадлежность каталогов managed root должен обеспечить будущий orchestrator вместе с MeetingStore. Сам transcriber не записывает SQLite.
+
+SHA-256 source проверяется до обработки и после неё. Новый final TXT сначала готовится во временном файле внутри output-dir и заменяет окончательный файл только после повторной проверки. При ошибке ранее существовавший final TXT сохраняется; cache и диагностика могут остаться как непубликованные материалы. Legacy-вызов `python3 src/gemini_transcribe_meeting.py AUDIO` сохраняет прежние пути и auto-open.
+
+Full cache provenance, orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy.
+
 ## What is not implemented yet
 
 - Gemini pipeline и Swift GUI не подключены к storage core; текущий production flow не меняется.

@@ -114,3 +114,5 @@
 ## Meeting storage (feature branch)
 
 [MEETING_STORAGE.md](MEETING_STORAGE.md) описывает реализованный storage core для истории встреч и версий анализа. Он пока не подключён к production flow, описанному выше; текущий GUI и pipeline продолжают работать без SQLite.
+
+Source-версия transcriber также поддерживает явный managed-output mode; production flow выше по-прежнему использует legacy-вызов.

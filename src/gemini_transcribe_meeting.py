@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import tempfile
 import difflib
 from pathlib import Path
 from datetime import datetime
@@ -126,7 +129,12 @@ def duration(path):
     return float(p.stdout.strip())
 
 
-def split_audio(source, outdir):
+def reject_symlink(path):
+    if path.is_symlink():
+        raise RuntimeError(f"Managed artifact is a symlink: {path}")
+
+
+def split_audio(source, outdir, managed=False):
     total = duration(source)
 
     log(f"Длительность: {total:.1f} сек.")
@@ -142,6 +150,8 @@ def split_audio(source, outdir):
         out = outdir / (
             f"{source.stem}_chunk{CHUNK}_ov{OVERLAP}_{n:03d}.m4a"
         )
+        if managed:
+            reject_symlink(out)
 
         if out.exists() and out.stat().st_size > 0:
             log(f"{n:03d}: уже существует — использую")
@@ -1552,14 +1562,48 @@ def assess_quality(rows, total_duration, diagnostics=None):
     }
 
 
-def main():
-    if len(sys.argv) != 2:
-        raise RuntimeError("Перетащи один аудиофайл на приложение")
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Расшифровка аудио; --output-dir включает managed mode."
+    )
+    parser.add_argument("audio", help="исходный аудиофайл")
+    parser.add_argument("--output-dir", type=Path, help="каталог результата (managed mode)")
+    parser.add_argument("--cache-dir", type=Path, help="каталог chunks/cache (managed mode)")
+    parser.add_argument(
+        "--expected-source-sha256", help="ожидаемый SHA-256 исходного файла (managed mode)"
+    )
+    args = parser.parse_args(argv)
+    managed_options = (args.output_dir, args.cache_dir, args.expected_source_sha256)
+    if any(value is not None for value in managed_options) and not all(
+        value is not None for value in managed_options
+    ):
+        parser.error("managed mode требует --output-dir, --cache-dir и --expected-source-sha256")
+    if args.expected_source_sha256 is not None and not re.fullmatch(
+        r"[0-9a-fA-F]{64}", args.expected_source_sha256
+    ):
+        parser.error("--expected-source-sha256 должен быть 64-символьным hex SHA-256")
+    return args
 
-    source = Path(sys.argv[1]).expanduser().resolve()
+
+def check_source_hash(source, expected):
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected.lower():
+        raise RuntimeError("SHA-256 исходного файла не совпадает; managed run остановлен")
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+    source = Path(args.audio).expanduser().resolve()
 
     if not source.is_file():
         raise RuntimeError(f"Файл не найден: {source}")
+
+    managed = args.output_dir is not None
+    if managed:
+        check_source_hash(source, args.expected_source_sha256)
 
     if not Path(FFMPEG).exists() or not Path(FFPROBE).exists():
         raise RuntimeError(
@@ -1568,13 +1612,18 @@ def main():
 
     key = get_key()
 
-    outdir = source.parent / source.stem
-    outdir.mkdir(exist_ok=True)
+    outdir = args.output_dir.expanduser().resolve() if managed else source.parent / source.stem
+    outdir.mkdir(parents=managed, exist_ok=True)
 
     # Все промежуточные артефакты складываем отдельно,
     # чтобы в основной папке оставались только результаты.
     service_dir = outdir / "_service"
+    if managed:
+        reject_symlink(service_dir)
     service_dir.mkdir(exist_ok=True)
+    cache_dir = args.cache_dir.expanduser().resolve() if managed else service_dir
+    if managed:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     log("=" * 60)
     log("GEMINI TRANSCRIBE")
@@ -1582,7 +1631,7 @@ def main():
     log(f"Результат: {outdir}")
     log("=" * 60)
 
-    chunks = split_audio(source, service_dir)
+    chunks = split_audio(source, cache_dir, managed=managed)
 
     chunk_parts = []
 
@@ -1594,6 +1643,9 @@ def main():
         txt_path = audio.with_name(
             audio.stem + "_transcript.txt"
         )
+        if managed:
+            reject_symlink(json_path)
+            reject_symlink(txt_path)
 
         log()
         log(f"=== Часть {number}/{len(chunks)} ===")
@@ -1682,29 +1734,46 @@ def main():
         source.stem + "_ПОЛНАЯ_РАСШИФРОВКА.txt"
     )
 
-    with final_txt.open("w", encoding="utf-8") as f:
-        f.write(source.stem + "\n")
-        f.write("=" * len(source.stem) + "\n\n")
+    staged_txt = None
+    if managed:
+        staged_txt = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=outdir, prefix=".transcript-", delete=False
+        )
+        staged_txt.close()
+    try:
+        target = Path(staged_txt.name) if managed else final_txt
+        with target.open("w", encoding="utf-8") as f:
+            f.write(source.stem + "\n")
+            f.write("=" * len(source.stem) + "\n\n")
 
-        for x in merged:
-            f.write(
-                f"[{fmt(x['start'])}–{fmt(x['end'])}] "
-                f"{x['global_speaker']}:\n"
-                f"{x['text']}\n\n"
+            for x in merged:
+                f.write(
+                    f"[{fmt(x['start'])}–{fmt(x['end'])}] "
+                    f"{x['global_speaker']}:\n"
+                    f"{x['text']}\n\n"
+                )
+
+        diag = service_dir / "merge_diagnostics.json"
+        if managed:
+            reject_symlink(diag)
+
+        with diag.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "boundaries": diagnostics,
+                    "quality": quality,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
             )
 
-    diag = service_dir / "merge_diagnostics.json"
-
-    with diag.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "boundaries": diagnostics,
-                "quality": quality,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        if managed:
+            check_source_hash(source, args.expected_source_sha256)
+    except BaseException:
+        if staged_txt is not None:
+            Path(staged_txt.name).unlink(missing_ok=True)
+        raise
 
     # Интеллектуальный протокол намеренно НЕ запускается здесь.
     #
@@ -1715,15 +1784,23 @@ def main():
     # Протокол запускается отдельно по готовому
     # *_ПОЛНАЯ_РАСШИФРОВКА.txt.
 
-    log()
-    log("=" * 60)
-    log("ГОТОВО")
-    log(f"Реплик в результате: {len(merged)}")
-    log(f"Расшифровка: {final_txt}")
-    log(f"Диагностика склейки: {diag}")
-    log("=" * 60)
+    try:
+        log()
+        log("=" * 60)
+        log("ГОТОВО")
+        log(f"Реплик в результате: {len(merged)}")
+        log(f"Расшифровка: {final_txt}")
+        log(f"Диагностика склейки: {diag}")
+        log("=" * 60)
 
-    subprocess.run(["/usr/bin/open", str(outdir)])
+        if managed:
+            os.replace(target, final_txt)
+        else:
+            subprocess.run(["/usr/bin/open", str(outdir)])
+    except BaseException:
+        if managed:
+            target.unlink(missing_ok=True)
+        raise
 
 
 if __name__ == "__main__":

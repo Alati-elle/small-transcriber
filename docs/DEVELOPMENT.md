@@ -11,6 +11,18 @@
 
 Файлы в `~/.local/bin`, `~/.local/share/gemini-meeting-pipeline` и `.app` на Desktop являются установленными копиями. Рабочий `vocabulary.txt`, Keychain, cache и результаты встреч не являются частью source tree.
 
+## Запуск transcriber из source
+
+```bash
+python3 src/gemini_transcribe_meeting.py AUDIO
+python3 src/gemini_transcribe_meeting.py AUDIO \
+  --output-dir DIR \
+  --cache-dir DIR \
+  --expected-source-sha256 HEX
+```
+
+Первый вызов сохраняет legacy layout рядом с source и auto-open. Во втором вызове `--output-dir` включает managed mode, `--cache-dir` задаёт каталог chunks/cache, а `--expected-source-sha256` передаёт 64-символьный hex SHA-256 source. Все три опции обязательны вместе. Managed-вызов пока является низкоуровневым building block для будущего orchestrator, а не пользовательским production workflow. Для тестов используйте только синтетические файлы; эти команды без mock вызывают ffmpeg и Gemini.
+
 ## Безопасный порядок изменения
 
 1. Выполнить `./scripts/verify-install.sh` и сохранить результат.
