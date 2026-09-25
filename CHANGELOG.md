@@ -4,11 +4,12 @@
 
 ## Unreleased
 
-- В protocol generator добавлен explicit managed-output mode с caller-provided пустым staging-каталогом и проверкой пары JSON/HTML перед публикацией. Legacy behavior сохранён; к orchestrator/GUI режим пока не подключён.
+- Добавлен source managed meeting pipeline orchestrator: SQLite lifecycle, изолированные run directories, проверка и публикация transcript/JSON/HTML, JSON Lines progress. К production Swift GUI ещё не подключён.
+- В protocol generator добавлен explicit managed-output mode с caller-provided пустым staging-каталогом и проверкой пары JSON/HTML перед публикацией. Legacy behavior сохранён; к production GUI режим пока не подключён.
 - Добавлена проверка provenance для managed transcription cache: versioned `manifest.json`, отдельные generations и атомарная запись cache-файлов. Legacy cache не изменён.
-- В transcriber добавлен explicit managed-output mode с каталогами output/cache от вызывающего слоя и проверкой SHA-256 source до и после обработки. Legacy behavior сохранён; managed mode ещё не подключён к GUI и storage orchestration.
+- В transcriber добавлен explicit managed-output mode с каталогами output/cache от вызывающего слоя и проверкой SHA-256 source до и после обработки. Legacy behavior сохранён; managed mode ещё не подключён к GUI.
 - Добавлен начальный meeting storage core: SQLite schema v1, UUIDv4 для встреч и runs, выбор активной версии анализа и проверка managed paths.
-- Storage core пока не подключён к транскрипции и GUI; production flow не изменён.
+- Storage core подключён только к source orchestrator; production GUI и flow не изменены.
 
 ## 2026-09-23 — baseline consolidation
 

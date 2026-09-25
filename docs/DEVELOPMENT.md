@@ -6,6 +6,7 @@
 
 - `src/gemini_transcribe_meeting.py`;
 - `src/gemini_make_protocol.py`;
+- `src/meeting_store.py` и `src/meeting_pipeline.py` для managed source flow;
 - `src/MeetingStatus.swift`;
 - `src/main.applescript`.
 
@@ -21,7 +22,7 @@ python3 src/gemini_transcribe_meeting.py AUDIO \
   --expected-source-sha256 HEX
 ```
 
-Первый вызов сохраняет legacy layout рядом с source и auto-open. Во втором вызове `--output-dir` включает managed mode, `--cache-dir` задаёт каталог chunks/cache, а `--expected-source-sha256` передаёт 64-символьный hex SHA-256 source. Все три опции обязательны вместе. Managed-вызов пока является низкоуровневым building block для будущего orchestrator, а не пользовательским production workflow. Для тестов используйте только синтетические файлы; эти команды без mock вызывают ffmpeg и Gemini.
+Первый вызов сохраняет legacy layout рядом с source и auto-open. Во втором вызове `--output-dir` включает managed mode, `--cache-dir` задаёт каталог chunks/cache, а `--expected-source-sha256` передаёт 64-символьный hex SHA-256 source. Все три опции обязательны вместе. Managed-вызов является низкоуровневым building block для source orchestrator, а не пользовательским production workflow. Для тестов используйте только синтетические файлы; эти команды без mock вызывают ffmpeg и Gemini.
 
 Managed cache использует `DIR/manifest.json` и `DIR/generations/<id>/`. Manifest записывается атомарно и должен точно совпасть с текущим source, параметрами обработки, моделью, шаблоном запроса и словарём для reuse. Отсутствующий или невалидный manifest создаёт новую generation без удаления старых файлов. Legacy-вызов manifest не создаёт.
 
@@ -32,7 +33,16 @@ python3 src/gemini_make_protocol.py TRANSCRIPT
 python3 src/gemini_make_protocol.py TRANSCRIPT --output-dir EMPTY_STAGING_DIR
 ```
 
-Первый вызов сохраняет legacy output рядом с transcript. `--output-dir` включает managed mode: каталог может отсутствовать или быть пустым, но непустой каталог отклоняется до обработки. Это низкоуровневый building block будущего orchestrator; production GUI пока вызывает legacy mode.
+Первый вызов сохраняет legacy output рядом с transcript. `--output-dir` включает managed mode: каталог может отсутствовать или быть пустым, но непустой каталог отклоняется до обработки. Это низкоуровневый building block source orchestrator; production GUI пока вызывает legacy mode.
+
+## Managed pipeline из source
+
+```bash
+python3 src/meeting_pipeline.py run AUDIO
+python3 src/meeting_pipeline.py run SYNTHETIC_AUDIO --storage-root TEMP_PRIVATE_DIR
+```
+
+Без `--storage-root` используется `MeetingStore.DEFAULT_ROOT`. Вызов реальных child scripts использует Gemini; для синтетических integration tests предусмотрены `--transcriber-script` и `--protocol-script`. Orchestrator ищет обычные child scripts рядом со своим файлом и запускает их через тот же `sys.executable`; будущая установка должна положить orchestrator, MeetingStore и оба scripts рядом. Текущий installer этого не делает, GUI не подключён. stdout — только JSON Lines progress/result, stderr — короткая диагностика, подробности child process — в приватных run logs.
 
 ## Безопасный порядок изменения
 

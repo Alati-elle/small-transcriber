@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Этот слой закладывает основу для истории встреч, версий анализа и безопасного выбора активного протокола. Позже на него смогут опираться повторный анализ готовой расшифровки и интерфейс истории. Сейчас это отдельный storage core, не часть рабочего pipeline.
+Этот слой хранит историю встреч, версии анализа и выбор активного протокола. Source-версия `meeting_pipeline.py` теперь связывает SQLite с managed transcriber и protocol generator. Production GUI пока использует legacy flow.
 
 ## Managed root
 
-Root по умолчанию: `~/Library/Application Support/Small Transcriber/`. Это внутреннее служебное хранилище приложения; пользователю не требуется работать с ним вручную. `MeetingStore()` и import модуля ничего там не создают. Root и `index.sqlite3` появляются только при явном вызове `initialize()` (в будущем — из integration layer); сейчас реальная пользовательская DB не создаётся.
+Root по умолчанию: `~/Library/Application Support/Small Transcriber/`. Это внутреннее служебное хранилище приложения; пользователю не требуется работать с ним вручную. `MeetingStore()` и import модуля ничего там не создают. Root и `index.sqlite3` появляются только при явном вызове `initialize()`; source orchestrator вызывает его после проверки и SHA-256 исходника. Тесты используют отдельный `--storage-root`, поэтому реальная пользовательская DB не создаётся.
 
-`initialize()` требует режим `0700` для root и `0600` для DB. Текущий слой не создаёт каталоги и файлы артефактов; их права нужно обеспечить при интеграции.
+`initialize()` требует режим `0700` для root и `0600` для DB. Orchestrator создаёт каталоги run с приватным umask `077`; stage logs имеют режим `0600`.
 
 ## Data model и SQLite schema v1
 
@@ -65,22 +65,43 @@ Protocol generator также поддерживает отдельный manage
 python3 src/gemini_make_protocol.py TRANSCRIPT --output-dir DIR
 ```
 
-`DIR` задаёт вызывающий слой как новый или уже существующий **пустой** staging-каталог. Generator пишет `*_ПРОТОКОЛ.json`, `*_ПРОТОКОЛ.html` и `_service/speaker_normalization.json` только внутрь него. Непустой каталог, включая прежнюю пару или один файл, отклоняется до обработки; предыдущая хорошая пара не изменяется. Оба новых файла проверяются до публикации; при обычной ошибке публикации частичная пара убирается. Внешнюю атомарную публикацию всего analysis run directory позднее выполнит orchestrator.
+`DIR` задаёт вызывающий слой как новый или уже существующий **пустой** staging-каталог. Generator пишет `*_ПРОТОКОЛ.json`, `*_ПРОТОКОЛ.html` и `_service/speaker_normalization.json` только внутрь него. Непустой каталог, включая прежнюю пару или один файл, отклоняется до обработки; предыдущая хорошая пара не изменяется. Оба новых файла проверяются до публикации; при обычной ошибке публикации частичная пара убирается. Внешнюю публикацию всего analysis run directory выполняет source orchestrator.
 
-Generator не записывает SQLite, не переключает active analysis и не создаёт run IDs. Orchestrator и подключение к GUI/storage пока не реализованы; production flow остаётся legacy. Manifest хранит только provenance cache и не заменяет SQLite.
+Generator не записывает SQLite, не переключает active analysis и не создаёт run IDs. Manifest хранит только provenance cache и не заменяет SQLite.
+
+## Phase 1B: managed orchestrator (source only)
+
+`python3 src/meeting_pipeline.py run AUDIO [--storage-root DIR]` проверяет и хеширует source до создания meeting. Затем он создаёт transcription run, запускает managed transcriber, проверяет TXT и source hash, публикует `.staging` в `published` одним rename и сохраняет относительный TXT path/hash в SQLite. После этого создаёт analysis run, запускает managed generator, проверяет JSON/HTML и hashes, публикует analysis directory, повторно проверяет outputs, сохраняет относительные paths/hashes, переключает active и читает его обратно. Exit code `0` возможен только после read-back.
+
+```text
+meetings/<meeting-id>/
+  transcriptions/<transcription-run-id>/
+    transcribe.log
+    cache/
+    published/*_ПОЛНАЯ_РАСШИФРОВКА.txt
+  analyses/<analysis-run-id>/
+    protocol.log
+    published/*_ПРОТОКОЛ.json
+    published/*_ПРОТОКОЛ.html
+```
+
+До публикации вместо `published/` используется `.staging/`. Run IDs, связи, статусы, hashes и active pointer принадлежат SQLite; содержимое — файлам. `published/` не перезаписывается. Проверка/rename каталога и обновление SQLite происходят последовательно, общей filesystem+DB транзакции нет. При сбое child process run получает `failed`, при отсутствии/невалидности outputs, публикации или финализации — `incomplete` (если run ещё `running`). Если active switch падает после успешной записи analysis, analysis остаётся `succeeded`, но не становится active. Staging, cache и logs сохраняются для диагностики.
+
+stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные IDs/phase/status); финальный `pipeline_succeeded` содержит пути к опубликованным outputs и логам. Ошибки дают `pipeline_failed` и ненулевой exit. Transcript, prompt и API key в события не включаются.
+
+Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Установленный GUI и installer пока не подключены к orchestrator.
 
 ## What is not implemented yet
 
-- Gemini pipeline и Swift GUI не подключены к storage core; текущий production flow не меняется.
+- Swift GUI не подключён к source orchestrator; текущий production flow не меняется.
 - Реальная пользовательская DB пока не создаётся.
-- Publication layer не реализован: существование файлов и совпадение их реальных SHA-256 с DB ещё не проверяются.
-- Legacy importer, повторный analysis и history UI отсутствуют.
+- Recovery running runs, повторный analysis существующей встречи, legacy importer и history UI пока отсутствуют.
 - Speaker overrides и user task state отсутствуют.
 
 ## Phase 1 roadmap
 
 1. Storage core — реализован в feature branch; проверяется на синтетических данных во временной DB.
-2. Интеграция с pipeline и публикация артефактов.
+2. Source-интеграция с pipeline и публикация артефактов — реализована; GUI не подключён.
 3. Версионированный повторный analysis.
 4. Legacy importer для существующих результатов.
 5. History GUI позднее.

@@ -116,3 +116,5 @@
 [MEETING_STORAGE.md](MEETING_STORAGE.md) описывает реализованный storage core для истории встреч и версий анализа. Он пока не подключён к production flow, описанному выше; текущий GUI и pipeline продолжают работать без SQLite.
 
 Source-версия transcriber также поддерживает явный managed-output mode; production flow выше по-прежнему использует legacy-вызов.
+
+В development source-версии `src/meeting_pipeline.py` теперь соединяет `MeetingStore`, managed transcriber и managed protocol generator: создаёт записи SQLite, публикует проверенные run directories одним rename и выбирает active analysis. Он выдаёт JSON Lines для будущего GUI. Установленные launcher/Swift GUI всё ещё вызывают два legacy CLI напрямую; installer orchestrator пока не разворачивает.
