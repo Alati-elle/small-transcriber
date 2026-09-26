@@ -19,6 +19,8 @@ xcrun swiftc \
     -module-cache-path "$build_tmp/module-cache" \
     "$source_file" \
     "$events_file" \
+    "$project_root/src/AppShell.swift" \
+    "$project_root/src/SettingsWindow.swift" \
     -o "$output_file"
 
 file "$output_file" | grep -q 'x86_64'

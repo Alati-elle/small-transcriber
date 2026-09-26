@@ -1,5 +1,11 @@
 # Meeting storage core
 
+## User config и история в app shell
+
+DEV настройки находятся в `~/Library/Application Support/Small Transcriber DEV/config.json`; будущий production путь — аналогичный root без ` DEV`. Schema v1 содержит `gemini.quota_timezone`, `known_models`, ручные `models.{id}.{rpd,rpm,tpm}` и для четырёх этапов `primary_model` с упорядоченным `fallback_models`. Model ID ограничен безопасными буквами/цифрами/`_.-`; секретов и API key в config нет. Отсутствующий файл даёт текущие исходные модели; повреждённый файл не переписывается автоматически и даёт предупреждение с defaults. `config-save` валидирует JSON, записывает временный файл с `0600`, выполняет `fsync` и `os.replace`; root имеет `0700`.
+
+Ручные лимиты показывают ожидание пользователя и не влияют на retry или исчерпание квоты. Локальное usage берётся из `gemini_request_usage`; подтверждённый `quotaValue` из API хранится отдельно в `gemini_quota_observations`. При конфликте shell показывает оба значения. `status` не создаёт DB/root и возвращает текущий quota day, usage, лимиты и максимум 50 последних встреч без текста расшифровок. Активный HTML выдаётся только при совпадении сохранённого SHA-256. История не создаёт новые встречи и не мигрирует существующие записи.
+
 ## Purpose
 
 Этот слой хранит историю встреч, версии анализа и выбор активного протокола. Source-версия `meeting_pipeline.py` связывает SQLite с managed transcriber и protocol generator. Source Swift GUI теперь получает progress и пути через JSON Lines orchestrator; production GUI пока использует legacy flow.
@@ -91,7 +97,7 @@ meetings/<meeting-id>/
 
 stdout orchestrator — JSON Lines (`event`, `timestamp`, безопасные IDs/phase/status); `pipeline_started` передаёт `meeting_dir`, stage events и `pipeline_failed` — `current_log_path`, финальный `pipeline_succeeded` содержит пути к опубликованным outputs и логам. Ошибки дают `pipeline_failed` и ненулевой exit. Transcript, prompt и API key в события не включаются. Source Swift GUI использует эти events и не читает/не пишет SQLite; «Открыть протокол» использует `active_html_path`, «Открыть папку» — `meeting_dir` как контейнер всей встречи.
 
-Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Production GUI и installer пока не подключены к orchestrator; отдельный DEV app использует managed flow. Source GUI не ищет прежний legacy protocol рядом с source при ошибке; history UI отложен.
+Автоматического recovery running runs пока нет: без ownership lock он мог бы ошибочно прервать параллельный процесс. `find_running_runs()` и `mark_interrupted()` остаются для отдельного milestone. Разные встречи имеют отдельные UUID-каталоги и cache; SQLite уже имеет bounded busy timeout. Production GUI и installer пока не подключены к orchestrator; отдельный DEV app использует managed flow. Source GUI не ищет прежний legacy protocol рядом с source при ошибке; полный history browser отложен.
 
 `retry-analysis --meeting-id UUID [--transcription-run-id UUID]` использует уже опубликованный TXT успешной транскрипции. При единственном successful transcription run он выбирается автоматически; при нескольких требуется явный ID. До нового analysis run проверяются managed path, наличие TXT и SHA-256 из SQLite. Source audio и transcriber не вызываются. Новый run получает собственные `protocol.log`, `.staging/` и `published/`; старые failed logs/staging и предыдущий active run остаются. Только проверенная пара JSON/HTML и успешный read-back позволяют переключить active analysis. Ошибка протокола оставляет новый run failed/incomplete и не меняет active pointer. События retry содержат `operation: "analysis_retry"` и не содержат `transcription_started`.
 
@@ -107,7 +113,7 @@ Protocol generator завершает процесс кодом `75`, когда
 
 - Production Swift GUI не подключён к source orchestrator; текущий установленный flow не меняется.
 - Реальная пользовательская DB пока не создаётся.
-- Recovery running runs, legacy importer и history UI пока отсутствуют; повторный analysis доступен через CLI и кнопку после ошибки в текущем окне.
+- Recovery running runs, legacy importer и полный history browser пока отсутствуют; повторный analysis доступен через CLI, кнопку после ошибки и recent list DEV shell.
 - Speaker overrides и user task state отсутствуют.
 
 ## Phase 1 roadmap

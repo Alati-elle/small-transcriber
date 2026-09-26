@@ -1,9 +1,10 @@
 import AppKit
 import Foundation
 
-final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class MeetingApp: NSObject, NSWindowDelegate {
 
     let inputPath: String
+    let initialRetry: (meetingID: String, transcriptionRunID: String)?
 
     var window: NSWindow!
 
@@ -34,6 +35,8 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var stdoutLines = JSONLineBuffer()
     var events = ManagedPipelineEvents()
     var finalResult: ManagedPipelineResult?
+    var onUpdate: (() -> Void)?
+    var onClose: (() -> Void)?
 
     let fm = FileManager.default
 
@@ -44,7 +47,11 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let override = ProcessInfo.processInfo.environment["SMALL_TRANSCRIBER_PIPELINE_SCRIPT"],
            !override.isEmpty { return override }
         #endif
+        #if DEV
+        return home + "/.local/share/gemini-meeting-pipeline/dev-managed/meeting_pipeline.py"
+        #else
         return home + "/.local/bin/meeting_pipeline.py"
+        #endif
     }()
 
     lazy var inputURL = URL(fileURLWithPath: inputPath)
@@ -54,15 +61,14 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }()
 
 
-    init(inputPath: String) {
+    init(inputPath: String, initialRetry: (meetingID: String, transcriptionRunID: String)? = nil) {
         self.inputPath = inputPath
+        self.initialRetry = initialRetry
         super.init()
     }
 
 
-    func applicationDidFinishLaunching(
-        _ notification: Notification
-    ) {
+    func start() {
         buildWindow()
 
         startDate = Date()
@@ -74,20 +80,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.updateElapsed()
         }
 
-        startPipeline()
-    }
-
-
-    func applicationShouldTerminateAfterLastWindowClosed(
-        _ sender: NSApplication
-    ) -> Bool {
-        return true
-    }
-
-    func applicationShouldTerminate(
-        _ sender: NSApplication
-    ) -> NSApplication.TerminateReply {
-        return currentProcess == nil ? .terminateNow : .terminateCancel
+        startPipeline(retry: initialRetry)
     }
 
 
@@ -110,6 +103,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
 
         window.title = "Обработка встречи"
+        window.isReleasedWhenClosed = false
         window.center()
         window.delegate = self
 
@@ -434,6 +428,13 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
            !root.isEmpty {
             arguments += ["--storage-root", root]
         }
+        #if DEV
+        if ProcessInfo.processInfo.environment["SMALL_TRANSCRIBER_STORAGE_ROOT"]?.isEmpty != false {
+            arguments += ["--storage-root", home + "/Library/Application Support/Small Transcriber DEV"]
+        }
+        #endif
+        #elseif DEV
+        arguments += ["--storage-root", home + "/Library/Application Support/Small Transcriber DEV"]
         #endif
         process.arguments = arguments
 
@@ -614,6 +615,7 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .failure(let message):
             finishError(message, logPath: events.currentLogPath)
         }
+        onUpdate?()
     }
 
 
@@ -737,16 +739,15 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 
     @objc func closeApp() {
-        NSApp.terminate(nil)
+        window.close()
     }
 
 
     func windowWillClose(
         _ notification: Notification
     ) {
-        if currentProcess == nil {
-            NSApp.terminate(nil)
-        }
+        elapsedTimer?.invalidate()
+        onClose?()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -758,13 +759,9 @@ final class MeetingApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 @main
 struct MeetingMain {
     static func main() {
-        guard CommandLine.arguments.count >= 2 else {
-            fputs("Usage: gemini_meeting_gui <audio-file>\n", stderr)
-            exit(2)
-        }
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
-        let controller = MeetingApp(inputPath: CommandLine.arguments[1])
+        let controller = AppShell(initialPath: CommandLine.arguments.dropFirst().first)
         app.delegate = controller
         app.run()
     }

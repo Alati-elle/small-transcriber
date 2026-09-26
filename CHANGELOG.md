@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- DEV app shell: обычный запуск без файла, drag в окно/на иконку, `NSOpenPanel`, отдельное переиспользуемое окно обработки, настройки и пять последних встреч. Production droplet не менялся.
+- Versioned приватный `config.json` с ручными RPD/RPM/TPM, списком model ID и выбором primary/fallback по этапам; managed Python runtime читает выбор, отсутствие/ошибка config безопасно возвращают прежние модели.
+- Read-only `status` для usage и истории; ручной лимит отдельно от подтверждённого quotaValue API и не влияет на retry.
+
 - Managed source: пять видимых этапов GUI с live progress, локальный счётчик Gemini по моделям, отдельный upload count и условный показ подтверждённого дневного лимита.
 - SQLite schema v2 добавляет `gemini_request_usage` и `gemini_quota_observations` с миграцией v1 без пересоздания встреч или runs; сутки считаются по `America/Los_Angeles`.
 - Structured Gemini request events и классификация 429 по metadata; подтверждённая дневная квота прекращает retry, optional speaker/name stages ограничены короткой политикой, а основной protocol failure остаётся критическим.

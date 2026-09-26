@@ -14,6 +14,7 @@ from datetime import datetime
 from gemini_telemetry import (DailyQuotaExhausted, classify, emit as progress_emit,
                               request as record_request, request_started, request_retry,
                               stage as progress_stage)
+from meeting_config import load as load_config, stage_models
 
 
 MODELS = [
@@ -21,6 +22,7 @@ MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash",
 ]
+STAGE_MODELS = {}
 
 API_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/"
@@ -101,7 +103,8 @@ def run_gemini_curl(command, key, payload, **kwargs):
         with os.fdopen(write_fd, "wb") as header:
             header.write(f"x-goog-api-key: {key}\n".encode("utf-8"))
         request_started(CURRENT_STAGE, model, attempt,
-                        2 if CURRENT_STAGE != "protocol_generation" and model == MODELS[0] else
+                        2 if CURRENT_STAGE != "protocol_generation" and
+                        model == STAGE_MODELS.get(CURRENT_STAGE, MODELS)[0] else
                         1 if CURRENT_STAGE != "protocol_generation" else None)
         result = subprocess.run(
             command + ["-H", f"@/dev/fd/{read_fd}", "--data-binary", "@-"],
@@ -930,7 +933,7 @@ def consolidate_speakers(rows, key):
     last_error = None
     all_models_503 = True
 
-    optional_models = MODELS[:2]
+    optional_models = STAGE_MODELS.get("speaker_normalization", MODELS[:2])
     for model_number, model in enumerate(optional_models, 1):
         if model in EXHAUSTED_MODELS:
             continue
@@ -1239,7 +1242,7 @@ def detect_speakers(rows, key):
     last_error = None
     all_models_503 = True
 
-    optional_models = MODELS[:2]
+    optional_models = STAGE_MODELS.get("name_detection", MODELS[:2])
     for model_number, model in enumerate(optional_models, 1):
         if model in EXHAUSTED_MODELS:
             continue
@@ -2370,6 +2373,14 @@ def prepare_output_dir(transcript_path, output_dir):
     return target
 
 
+def configure_managed_models(root):
+    global MODELS, STAGE_MODELS
+    config, _ = load_config(root)
+    STAGE_MODELS = {stage: stage_models(config, stage) for stage in
+                    ("speaker_normalization", "name_detection")}
+    MODELS = stage_models(config, "protocol_generation")
+
+
 def main():
     global CURRENT_STAGE
     args = parse_args(sys.argv[1:])
@@ -2381,6 +2392,8 @@ def main():
         )
 
     managed = args.output_dir is not None
+    if managed and os.environ.get("SMALL_TRANSCRIBER_STORAGE_ROOT"):
+        configure_managed_models(os.environ["SMALL_TRANSCRIBER_STORAGE_ROOT"])
     output_dir = prepare_output_dir(transcript_path, args.output_dir)
 
     log("=" * 60)

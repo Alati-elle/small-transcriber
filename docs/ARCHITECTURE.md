@@ -1,5 +1,11 @@
 # Архитектура
 
+## DEV app shell (source milestone)
+
+DEV `.app` теперь собирается с самим Swift executable как `CFBundleExecutable`. Один `AppShell` владеет жизненным циклом приложения и постоянным главным окном. Запуск без файла показывает drop target, кнопку выбора, текущий счётчик Gemini и пять последних встреч. Finder `openFiles`, drop в окне и `NSOpenPanel` проходят одну проверку файла и создают один `MeetingApp` с прежней обработкой JSON Lines; параллельную обработку вторым окном GUI не запускает. После завершения окно обработки можно закрыть, главное окно обновляет usage/history и остаётся доступным. `Cmd+,` и кнопка открывают одно окно настроек.
+
+`AppShell` и `SettingsWindow` не обращаются к SQLite: `meeting_pipeline.py status`, `config-get` и `config-save` дают JSON интерфейс. `MeetingStore.list_recent_meetings()` читает только метаданные и подтверждает SHA-256 активного HTML. Нажатие на встречу открывает активный HTML либо запускает существующий `retry-analysis` для успешной расшифровки. Production AppleScript droplet и установленный production GUI остаются legacy.
+
 Документ описывает baseline production на 23 сентября 2026 года. Он не описывает планируемые исправления как уже реализованные.
 
 ## Flow

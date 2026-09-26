@@ -239,7 +239,7 @@ class MeetingStore:
 
     def gemini_usage_snapshot(self):
         day = quota_date_pacific()
-        with closing(self._connect()) as conn:
+        with closing(self._connect(readonly=True)) as conn:
             rows = conn.execute("SELECT model, request_type, count(*) AS n FROM gemini_request_usage "
                                 "WHERE quota_date_pacific=? GROUP BY model,request_type", (day,))
             models, upload = {}, 0
@@ -257,9 +257,47 @@ class MeetingStore:
         return {'quota_date': day, 'models': models, 'total': sum(models.values()),
                 'upload': upload, 'observed_daily_limits': limits}
 
-    def _connect(self):
+    def list_recent_meetings(self, limit=10):
+        """Read-only shell summary; do not return transcript or protocol contents."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("Invalid history limit")
+        with closing(self._connect(readonly=True)) as conn:
+            rows = conn.execute(
+                "SELECT m.id AS meeting_id,m.title,m.created_at,m.active_analysis_run_id,"
+                "a.output_html_path,a.output_html_sha256,"
+                "(SELECT t.id FROM transcription_runs t WHERE t.meeting_id=m.id "
+                "AND t.status='succeeded' ORDER BY t.created_at DESC,t.id DESC LIMIT 1) "
+                "AS transcription_run_id,"
+                "(SELECT t.transcript_path FROM transcription_runs t WHERE t.meeting_id=m.id "
+                "AND t.status='succeeded' ORDER BY t.created_at DESC,t.id DESC LIMIT 1) "
+                "AS transcript_path,"
+                "(SELECT t.transcript_sha256 FROM transcription_runs t WHERE t.meeting_id=m.id "
+                "AND t.status='succeeded' ORDER BY t.created_at DESC,t.id DESC LIMIT 1) "
+                "AS transcript_sha256 "
+                "FROM meetings m LEFT JOIN analysis_runs a ON a.id=m.active_analysis_run_id "
+                "ORDER BY m.created_at DESC,m.id DESC LIMIT ?", (limit,))
+            result = []
+            for row in rows:
+                item = dict(row)
+                transcript = item.pop("transcript_path")
+                transcript_digest = item.pop("transcript_sha256")
+                html = item.pop("output_html_path")
+                digest = item.pop("output_html_sha256")
+                item["has_transcript"] = bool(transcript and transcript_digest and
+                    (transcript_file := self.resolve_managed_path(transcript)).is_file() and
+                    file_sha256(transcript_file) == transcript_digest)
+                item["has_active_protocol"] = bool(html and digest and
+                    (path := self.resolve_managed_path(html)).is_file() and file_sha256(path) == digest)
+                item["protocol_path"] = str(path) if item["has_active_protocol"] else None
+                item["status"] = ("protocol_ready" if item["has_active_protocol"] else
+                                  "transcript_ready" if item["has_transcript"] else "processing_or_failed")
+                result.append(item)
+            return result
+
+    def _connect(self, readonly=False):
         # mode=rw prevents an accidental database creation outside initialize().
-        uri = "file:{}?mode=rw".format(quote(str(self.db_path.absolute())))
+        uri = "file:{}?mode={}".format(quote(str(self.db_path.absolute())),
+                                        "ro" if readonly else "rw")
         conn = sqlite3.connect(uri, uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

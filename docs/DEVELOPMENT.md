@@ -9,9 +9,27 @@
 - `src/meeting_store.py` и `src/meeting_pipeline.py` для managed source flow;
 - `src/ManagedPipelineEvents.swift` для разбора JSON Lines в GUI;
 - `src/MeetingStatus.swift`;
+- `src/AppShell.swift`, `src/SettingsWindow.swift` и `src/meeting_config.py` для DEV shell/config;
 - `src/main.applescript`.
 
 Файлы в `~/.local/bin`, `~/.local/share/gemini-meeting-pipeline` и `.app` на Desktop являются установленными копиями. Рабочий `vocabulary.txt`, Keychain, cache и результаты встреч не являются частью source tree.
+
+## DEV app shell и config
+
+`./scripts/build-gui.sh` собирает release binary, `./scripts/build-dev-app.sh` — отдельный DEV `.app` с `-DDEBUG -DDEV`; оба используют четыре Swift source-файла. DEV bundle содержит Swift executable напрямую, поэтому обычный запуск открывает главное окно, а Finder передаёт аудиофайл через `application(_:openFiles:)`. DEV runtime ищет Python scripts в `~/.local/share/gemini-meeting-pipeline/dev-managed/` и DB/config в `~/Library/Application Support/Small Transcriber DEV/`. Production installer и `src/main.applescript` этим milestone не меняются.
+
+`./scripts/install-dev-shell.sh` сначала показывает dry run. `--apply` устанавливает только DEV Python/runtime и DEV Desktop app, сохраняя прежние файлы в `dev-managed/backups/app-shell_*`. DEV `index.sqlite3`, встречи, usage и пользовательский config не входят в список целей установки.
+
+Read-only preflight без создания root:
+
+```bash
+/usr/bin/python3 src/meeting_pipeline.py status --storage-root "$HOME/Library/Application Support/Small Transcriber DEV" --limit 5
+/usr/bin/python3 src/meeting_pipeline.py config-get --storage-root "$HOME/Library/Application Support/Small Transcriber DEV"
+```
+
+`config-save` принимает полный JSON через stdin; UI вызывает его после редактирования. Отсутствующий config не создаётся, пока пользователь не сохранит настройки. Повреждённый config оставляется на месте; UI отдельно подтверждает замену. `known_models` расширяется вручную без запроса к Gemini. Выбор model/fallback выполняется Python child scripts в managed mode через проверенный config и `SMALL_TRANSCRIBER_STORAGE_ROOT`. При отсутствии config текущий model order сохранён. Manual RPD/RPM/TPM служат подсказкой в GUI и не останавливают pipeline.
+
+Для fake smoke используйте `SMALL_TRANSCRIBER_PIPELINE_SCRIPT=$PWD/tests/fake_meeting_pipeline.py` и отдельный временный `SMALL_TRANSCRIBER_STORAGE_ROOT` при прямом запуске DEV binary. Fake script не делает сетевых вызовов Gemini. Не сбрасывайте и не копируйте пользовательскую DEV DB ради тестов.
 
 ## Запуск transcriber из source
 

@@ -10,6 +10,7 @@ import sys
 import time
 from gemini_telemetry import (DailyQuotaExhausted, classify, request as record_request,
                               request_started, request_retry, stage as progress_stage)
+from meeting_config import load as load_config, stage_models
 import tempfile
 import uuid
 import difflib
@@ -20,6 +21,7 @@ CHUNK = 360
 OVERLAP = 30
 STEP = CHUNK - OVERLAP
 MODEL = "gemini-3.5-transcribe"
+MODEL_ORDER = [MODEL]
 CACHE_SCHEMA_VERSION = 1
 CACHE_FORMAT_VERSION = 1
 FFMPEG_AUDIO_ARGS = ["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "64k"]
@@ -314,11 +316,13 @@ def transcription_payload(uri, vocabulary):
 
 
 def transcribe(uri, key, vocabulary=None):
+    global MODEL, API
     if vocabulary is None:
         vocabulary = load_vocabulary()
     payload = transcription_payload(uri, vocabulary)
 
     attempt = 1
+    model_index = MODEL_ORDER.index(MODEL)
 
     while True:
         log(f"  Gemini: попытка {attempt}")
@@ -352,6 +356,13 @@ def transcribe(uri, key, vocabulary=None):
         if not error:
             return data
 
+        if error.get("code") == 503 and model_index + 1 < len(MODEL_ORDER):
+            model_index += 1
+            MODEL = MODEL_ORDER[model_index]
+            API = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+            attempt = 1
+            continue
+
         if error.get("code") != 429:
             raise RuntimeError(
                 json.dumps(error, ensure_ascii=False, indent=2)
@@ -359,9 +370,21 @@ def transcribe(uri, key, vocabulary=None):
 
         quota_kind, observation = classify(error)
         if quota_kind == "daily_quota_exhausted":
+            if model_index + 1 < len(MODEL_ORDER):
+                model_index += 1
+                MODEL = MODEL_ORDER[model_index]
+                API = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+                attempt = 1
+                continue
             raise DailyQuotaExhausted("Gemini daily quota exhausted")
 
         if attempt >= MAX_TRANSCRIBE_ATTEMPTS:
+            if model_index + 1 < len(MODEL_ORDER):
+                model_index += 1
+                MODEL = MODEL_ORDER[model_index]
+                API = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+                attempt = 1
+                continue
             raise RuntimeError(
                 "Gemini rate limit: "
                 f"chunk не распознан после "
@@ -1598,7 +1621,7 @@ def write_json_atomic(path, data):
 
 
 def cache_identity(source, expected_sha, vocabulary):
-    return {
+    identity = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "cache_format_version": CACHE_FORMAT_VERSION,
         "source_sha256": expected_sha.lower(),
@@ -1620,6 +1643,17 @@ def cache_identity(source, expected_sha, vocabulary):
         "request_sha256": json_sha256(transcription_payload("<file-uri>", vocabulary)),
         "vocabulary_sha256": json_sha256(vocabulary),
     }
+    if len(MODEL_ORDER) > 1:
+        identity["model_order"] = MODEL_ORDER
+    return identity
+
+
+def configure_managed_models(root):
+    global MODEL, MODEL_ORDER, API
+    config, _ = load_config(root)
+    MODEL_ORDER = stage_models(config, "transcription")
+    MODEL = MODEL_ORDER[0]
+    API = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 
 def prepare_managed_cache(cache_dir, identity):
@@ -1658,6 +1692,8 @@ def main():
         raise RuntimeError(f"Файл не найден: {source}")
 
     managed = args.output_dir is not None
+    if managed and os.environ.get("SMALL_TRANSCRIBER_STORAGE_ROOT"):
+        configure_managed_models(os.environ["SMALL_TRANSCRIBER_STORAGE_ROOT"])
     if managed:
         check_source_hash(source, args.expected_source_sha256)
 

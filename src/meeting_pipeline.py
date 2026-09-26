@@ -13,6 +13,7 @@ from pathlib import Path
 
 from meeting_store import MeetingStore, file_sha256
 from gemini_telemetry import PREFIX
+from meeting_config import load as load_config, save as save_config
 
 
 HERE = Path(__file__).resolve().parent
@@ -474,14 +475,46 @@ def retry_analysis(meeting_id, root=None, transcription_run_id=None, protocol=No
 
 def main(argv=None):
     parser = ProgressParser(description="Managed meeting pipeline")
-    parser.add_argument("command", choices=["run", "retry-analysis"])
+    parser.add_argument("command", choices=["run", "retry-analysis", "status", "config-get", "config-save"])
     parser.add_argument("audio", type=Path, nargs="?")
     parser.add_argument("--meeting-id")
     parser.add_argument("--transcription-run-id")
     parser.add_argument("--storage-root", type=Path)
     parser.add_argument("--transcriber-script", type=Path, help="test/dev child script")
     parser.add_argument("--protocol-script", type=Path, help="test/dev child script")
+    parser.add_argument("--limit", type=int, default=10)
     args = parser.parse_args(argv)
+    if args.command in ("status", "config-get", "config-save"):
+        if args.audio or args.meeting_id or args.transcription_run_id or args.transcriber_script or args.protocol_script:
+            parser.error("Unexpected processing arguments")
+        store = MeetingStore(args.storage_root)
+        config, warning = load_config(store.root)
+        if args.command == "config-get":
+            print(json.dumps({"config": config, "warning": warning, "path": str(store.root / "config.json")},
+                             ensure_ascii=False))
+            return 0
+        if args.command == "config-save":
+            try:
+                data = json.load(sys.stdin)
+                save_config(store.root, data)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                print("Invalid config: " + type(error).__name__, file=sys.stderr)
+                return 2
+            print(json.dumps({"saved": True}))
+            return 0
+        if not 1 <= args.limit <= 50:
+            parser.error("History limit must be 1..50")
+        if not store.db_path.is_file():
+            usage = {"quota_date": "", "models": {}, "total": 0,
+                     "upload": 0, "observed_daily_limits": {}}
+            recent = []
+        else:
+            usage = store.gemini_usage_snapshot()
+            recent = store.list_recent_meetings(args.limit)
+        print(json.dumps({"usage": usage, "recent_meetings": recent,
+                          "manual_limits": config["gemini"]["models"],
+                          "config_warning": warning}, ensure_ascii=False))
+        return 0
     if args.command == "run":
         if args.audio is None or args.meeting_id or args.transcription_run_id:
             parser.error("run requires audio and cannot select an existing meeting")
